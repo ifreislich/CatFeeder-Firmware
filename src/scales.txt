@@ -1,0 +1,23 @@
+Aviwe
+offset: 119903
+factor: 495.438293
+
+Catkin
+offset: 295608
+factor: 428.312347
+
+Fred
+offset: 114136
+factor: 397.200256
+
+Gobbolino
+offset: 575358
+factor: 444.196472
+
+Oliver
+offset: 228772
+factor: 443.108307
+
+Sophie
+offset: 181783
+factor: 437.380341

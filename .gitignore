@@ -1,0 +1,5 @@
+.pio
+.vscode
+lib/AccelStepper/
+lib/FastCRC/
+lib/HX711/
