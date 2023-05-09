@@ -88,7 +88,6 @@ volatile uint32_t       weigand_counter;       // countdown until we assume ther
 
 uint8_t       state = 0;
 time_t        closeTime = 0, lastFeed = 0;
-float         weight;
 struct cfg    conf;
 
 void wshandleRoot(void);
@@ -103,6 +102,7 @@ void wshandleTare(void);
 
 int checkCard(uint8_t, uint16_t);
 const char *catName(uint8_t, uint16_t);
+float weigh(bool);
 void debug(byte, const char *, ...);
 void ntpCallBack(struct timeval *);
 void wifiEvent(WiFiEvent_t);
@@ -203,7 +203,6 @@ setup()
   scale.begin(HX711_DATA, HX711_CLK);
   scale.set_scale(conf.scale);
   scale.set_offset(conf.offset);
-  weight = scale.get_units(5);
   state |= STATE_WEIGHTREPORT;
   //init and get the time
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
@@ -271,9 +270,10 @@ loop()
     debug(true, "Door should be closed, reclosing");
     closeDoor();
   }
-  weight = (weight * 10 + scale.get_units(2)) / 11;
+
+  weigh(false);
   if (state & STATE_WEIGHTREPORT && time(NULL) - lastFeed > 30) {
-    debug(true, "Weight: %8.2fg", weight);
+    debug(true, "Weight: %8.2fg", weigh(true));
     state &= ~STATE_WEIGHTREPORT;
   }
 
@@ -335,7 +335,6 @@ int
 checkCard(uint8_t facilityCode, uint16_t cardCode)
 {
   int i;
-  debug(true, "Read card, Facility= %d, Code= %d, Weight= %-.0fg", facilityCode, cardCode, weight);
 
   for (i = 0; i < CFG_NCATS; i++)
     if (conf.cat[i].facility == facilityCode && conf.cat[i].id == cardCode)
@@ -447,6 +446,30 @@ dispense(int gramms)
   ret = 1;
   
   return (ret);
+}
+
+float
+weigh(bool doAverage)
+{
+  static float    weight[100];
+  static uint8_t  pos=0;
+  float           total;
+  uint8_t         samples = 0;
+
+  if (pos == 100)
+    pos = 0;
+  weight[pos] = scale.get_units(1);
+
+  if (!doAverage)
+    return(weight[pos++]);
+  
+  pos++;
+  for (int i = 0; i < 100; i++)
+    if (weight[i]) {
+      total += weight[i];
+      samples++;
+    }
+  return(total / samples);
 }
 
 void
@@ -577,7 +600,7 @@ wshandleRoot(void) {
       "</body>"
     "</html>",
     conf.hostname, conf.hostname,
-    hr, min % 60, sec % 60, weight, sizeof(struct cfg), conf.offset, conf.scale
+    hr, min % 60, sec % 60, weigh(true), sizeof(struct cfg), conf.offset, conf.scale
   );
   webserver.send(200, "text/html", body);
 }
