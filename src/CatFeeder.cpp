@@ -7,7 +7,6 @@
 #include <ArduinoOTA.h>
 #include <FastCRC.h>
 #include <HX711.h>
-#include <AccelStepper.h>
 #include <esp_sntp.h>
 #include <time.h>
 #include <sys/time.h>
@@ -41,6 +40,8 @@ struct cfg {
      uint8_t  flags;
   } cat[CFG_NCATS];
   char      pad;
+  uint8_t   perFeed;
+  uint8_t   quota;
   uint16_t  crc;
 } __attribute__((__packed__));
 
@@ -48,7 +49,7 @@ struct cfg {
 #define CFG_ACCESS    0x01
 #define CFG_DISPENSE  0x02
 
-#define SCALE_FACTOR 247.40840840840840840840f
+#define SCALE_FACTOR 247.408408f
 #define SCALE_OFFSET 62236
 
 const char* ntpServer = "pool.ntp.org";
@@ -57,20 +58,26 @@ const int   daylightOffset_sec = 0 * 3600;
 
 #define CLOSE_LIMIT 17
 #define OPEN_LIMIT  5
-#define LOGPORT 5001
+#define LOGPORT     5001
 
-#define AUGER_EN   13
-#define AUGER_DIR  14
-#define AUGER_STEP 12
-#define AUGER_MICROSTEP  25
+#define PIN_AUGER_EN        13
+#define PIN_AUGER_DIR       14
+#define PIN_AUGER_STEP      12
+#define PIN_AUGER_SLEEP     23
+#define PIN_AUGER_MICROSTEP 25
+#define AUGER_DIR_CW    1
+#define AUGER_DIR_CCW   0
 
-#define DOOR_EN         16
-#define DOOR_DIR        15
-#define DOOR_STEP       2
-#define DOOR_MICROSTEP  4
+#define PIN_DOOR_EN         16
+#define PIN_DOOR_DIR        15
+#define PIN_DOOR_STEP       2
+#define PIN_DOOR_SLEEP      18
+#define PIN_DOOR_MICROSTEP  4
+#define DOOR_DIR_CLOSE  0
+#define DOOR_DIR_OPEN   1
 
-#define DATA0           27
-#define DATA1           26
+#define PIN_DATA0       27
+#define PIN_DATA1       26
 #define MAX_BITS        100            // max number of bits 
 #define WEIGAND_TIMEOUT 20     // timeout in ms on Wiegand sequence 
 #define DOOR_TIMEOUT    60        // Door stays unlocked for max X seconds
@@ -88,6 +95,7 @@ volatile uint32_t       weigand_counter;       // countdown until we assume ther
 
 uint8_t       state = 0;
 time_t        closeTime = 0, lastFeed = 0;
+float         dispensedTotal = 0;
 struct cfg    conf;
 
 void wshandleRoot(void);
@@ -106,13 +114,17 @@ float weigh(bool);
 void debug(byte, const char *, ...);
 void ntpCallBack(struct timeval *);
 void wifiEvent(WiFiEvent_t);
-int dispense(int);
+float dispense(int);
 void defaultSettings(void);
 void saveSettings(void);
 void configInit(void);
 void closeDoor(void);
 void openDoor(void);
 void urlDecode(char *);
+void shutdownDoor(void);
+void shutdownAuger(void);
+void enableDoor(void);
+void enableAuger(void);
 
 // interrupt that happens when INTO goes low (0 bit)
 void IRAM_ATTR ISR_D0(void)
@@ -130,8 +142,9 @@ void IRAM_ATTR ISR_D1(void)
   weigand_counter = millis() + WEIGAND_TIMEOUT;
 }
 
-#define   HX711_CLK 32
-#define   HX711_DATA 34
+#define PIN_HX711_CLK   32
+#define PIN_HX711_DATA  34  // This is an input only pin without pullup.
+#define PIN_HX711_RATE  33
 HX711     scale;
 WebServer webserver(80);
 
@@ -140,25 +153,29 @@ setup()
 {
   char  hostname[28];
   timeval tv;
-  timezone tz = {0, 0 };
+  timezone tz = {0, 0};
   
   delay(100);
-  pinMode(AUGER_EN, OUTPUT);
-  digitalWrite(AUGER_EN, HIGH);
-  pinMode(AUGER_DIR, OUTPUT);
-  pinMode(AUGER_STEP, OUTPUT);
-  pinMode(AUGER_MICROSTEP, OUTPUT);
-  digitalWrite(AUGER_MICROSTEP, LOW);  // HIGH = 3200, LOW = 200 steps per revolution
+  pinMode(PIN_AUGER_EN, OUTPUT);
+  digitalWrite(PIN_AUGER_EN, HIGH);
+  pinMode(PIN_AUGER_SLEEP, OUTPUT);
+  digitalWrite(PIN_AUGER_SLEEP, HIGH);
+  pinMode(PIN_AUGER_DIR, OUTPUT);
+  pinMode(PIN_AUGER_STEP, OUTPUT);
+  pinMode(PIN_AUGER_MICROSTEP, OUTPUT);
+  digitalWrite(PIN_AUGER_MICROSTEP, HIGH);  // HIGH = 3200, LOW = 200 steps per revolution
 
-  pinMode(DOOR_EN, OUTPUT);
-  digitalWrite(DOOR_EN, HIGH);
-  pinMode(DOOR_DIR, OUTPUT);
-  pinMode(DOOR_STEP, OUTPUT);
-  pinMode(DOOR_MICROSTEP, OUTPUT);
-  digitalWrite(DOOR_MICROSTEP, LOW);
+  pinMode(PIN_DOOR_EN, OUTPUT);
+  digitalWrite(PIN_DOOR_EN, HIGH);
+  pinMode(PIN_DOOR_SLEEP, OUTPUT);
+  digitalWrite(PIN_DOOR_SLEEP, HIGH);
+  pinMode(PIN_DOOR_DIR, OUTPUT);
+  pinMode(PIN_DOOR_STEP, OUTPUT);
+  pinMode(PIN_DOOR_MICROSTEP, OUTPUT);
+  digitalWrite(PIN_DOOR_MICROSTEP, LOW);
 
-  pinMode(DATA0, INPUT);
-  pinMode(DATA1, INPUT);
+  pinMode(PIN_DATA0, INPUT);
+  pinMode(PIN_DATA1, INPUT);
   pinMode(CLOSE_LIMIT, INPUT);
   pinMode(OPEN_LIMIT, INPUT);
   if (!digitalRead(CLOSE_LIMIT))
@@ -172,7 +189,6 @@ setup()
   WiFi.onEvent(wifiEvent, ARDUINO_EVENT_WIFI_STA_START);
   WiFi.mode(WIFI_STA);
   
-  //("CatFeeder-" + WiFi.macAddress()).toCharArray(hostname, 28);
   WiFi.disconnect(true);
   delay(100);
   strcpy(hostname, "CatFeeder-");
@@ -200,10 +216,11 @@ setup()
   settimeofday(&tv, &tz);
  */
 
-  scale.begin(HX711_DATA, HX711_CLK);
+  pinMode(PIN_HX711_RATE, 0); // 0: 10Hz, 1: 80Hz
+  scale.begin(PIN_HX711_DATA, PIN_HX711_CLK);
   scale.set_scale(conf.scale);
   scale.set_offset(conf.offset);
-  state |= STATE_WEIGHTREPORT;
+  state &= ~STATE_WEIGHTREPORT;
   //init and get the time
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   sntp_set_time_sync_notification_cb(ntpCallBack);
@@ -248,16 +265,16 @@ setup()
   ArduinoOTA.begin();
   closeDoor();
   openDoor();
-  attachInterrupt(DATA0, ISR_D0, FALLING);
-  attachInterrupt(DATA1, ISR_D1, FALLING);
+  attachInterrupt(PIN_DATA0, ISR_D0, FALLING);
+  attachInterrupt(PIN_DATA1, ISR_D1, FALLING);
   weigand_counter = millis();
 }
 
 void
 loop()
 {
-  static unsigned long facilityCode = 0;      // decoded facility code
-  static unsigned long cardCode = 0;          // decoded card code
+  uint8_t   facilityCode = 0;      // decoded facility code
+  uint16_t  cardCode = 0;          // decoded card code
   
   ArduinoOTA.handle();
   webserver.handleClient();
@@ -286,28 +303,18 @@ loop()
 
     switch (bitCount) {
       case 35: // 35 bit HID Corporate 1000 format
-        // facility code = bits 2 to 14
-        for (i = 2; i < 14; i++) {
-          facilityCode <<= 1;
-          facilityCode |= databits[i];
-        }
-
-        // card code = bits 15 to 34
-        for (i = 14; i < 34; i++) {
-          cardCode <<= 1;
-          cardCode |= databits[i];
-        }
-        if (facilityCode && cardCode)
-          checkCard(facilityCode, cardCode);
+        // facility code = bits 2 to 14 (4096)
+        // card code = bits 15 to 34 (524288)
+        // For now, we don't support 35 bit Wiegand.
         break;
       case 26: // standard 26 bit format
-        // facility code = bits 2 to 9
+        // facility code = bits 2 to 9 (128)
         for (i = 1; i < 9; i++) {
           facilityCode <<= 1;
           facilityCode |= databits[i];
         }
 
-        // card code = bits 10 to 23
+        // card code = bits 10 to 23 (4096)
         for (i = 9; i < 25; i++) {
           cardCode <<= 1;
           cardCode |= databits[i];
@@ -334,7 +341,8 @@ loop()
 int
 checkCard(uint8_t facilityCode, uint16_t cardCode)
 {
-  int i;
+  float dispensed;
+  int   i;
 
   for (i = 0; i < CFG_NCATS; i++)
     if (conf.cat[i].facility == facilityCode && conf.cat[i].id == cardCode)
@@ -353,7 +361,7 @@ checkCard(uint8_t facilityCode, uint16_t cardCode)
       openDoor();
   }
   else if (conf.cat[i].flags & CFG_DISPENSE)
-    dispense(10);
+    dispensedTotal += dispense(conf.perFeed);
   else
     closeDoor();
   return (1);
@@ -382,14 +390,14 @@ closeDoor(void)
   if (digitalRead(CLOSE_LIMIT) && ~state & STATE_OPEN) // Just reset the open timer if the door is closed
     return;
   debug(true, "Closing");
-  digitalWrite(DOOR_DIR, LOW);
-  digitalWrite(DOOR_EN, LOW);
+  digitalWrite(PIN_DOOR_DIR, DOOR_DIR_CLOSE);
+  enableDoor();
   for (i = 0; !digitalRead(CLOSE_LIMIT); i++) {
-    digitalWrite(DOOR_STEP, HIGH);
-    digitalWrite(DOOR_STEP, LOW);
+    digitalWrite(PIN_DOOR_STEP, HIGH);
+    digitalWrite(PIN_DOOR_STEP, LOW);
     delayMicroseconds(1200);
   }
-  digitalWrite(DOOR_EN, HIGH);
+  shutdownDoor();
   state &= ~STATE_OPEN;
 }
 
@@ -397,55 +405,71 @@ void
 openDoor(void)
 {
   debug(true, "Opening");
-  digitalWrite(DOOR_DIR, HIGH);
-  digitalWrite(DOOR_EN, LOW);
+  digitalWrite(PIN_DOOR_DIR, DOOR_DIR_OPEN);
+  enableDoor();
   for (int i = 0; i < 2650 && !digitalRead(OPEN_LIMIT); i++) {
-    digitalWrite(DOOR_STEP, HIGH);
-    digitalWrite(DOOR_STEP, LOW);
+    digitalWrite(PIN_DOOR_STEP, HIGH);
+    digitalWrite(PIN_DOOR_STEP, LOW);
     delayMicroseconds(1200);
   }
   state |= STATE_OPEN;
-  digitalWrite(DOOR_EN, HIGH);
+  shutdownDoor();
 }
 
-#define STEP_DELAY 1500
-int
-dispense(int gramms)
+#define STEP_DELAY 250
+float
+dispense(int grams)
 {
-  int ret = 5;
+  float startWeight = weigh(false), curWeight;
 
-  debug(true, "Dispense %dg", gramms);
-  digitalWrite(AUGER_EN, LOW);
-  for (; ret > 1; ret--) {
-    digitalWrite(AUGER_DIR, HIGH);
-    for (int i = 0; i < 400; i++) {
-      digitalWrite(AUGER_STEP, HIGH);
-      digitalWrite(AUGER_STEP, LOW);
+  debug(true, "Dispense %dg", grams);
+  enableAuger();
+  // This is a bit of a magic number. 5 revolutions with a reversal
+  // of 0.25 revolution every revolutions dispenses about 10 grams
+  // if the kibbles don't get stuck. So, try rotating 4 as much as
+  // needed which works out to 2 revolution per gram.
+  for(uint8_t i = 0, stop = 0; !stop && i < grams * 2; i++) {
+    digitalWrite(PIN_AUGER_DIR, AUGER_DIR_CW);
+    for (int i = 0; !stop && i < 3200; i++) {
+      digitalWrite(PIN_AUGER_STEP, HIGH);
+      digitalWrite(PIN_AUGER_STEP, LOW);
       delayMicroseconds(STEP_DELAY);
+      // Weigh every 45 degrees rotation
+      if (i % 400 == 0)
+        curWeight = weigh(false);
+      if (i % 400 == 0 && curWeight - startWeight > grams)
+        stop = 1;
     }
-    digitalWrite(AUGER_DIR, LOW);
-    for (int i = 0; i < 100; i++) {
-      digitalWrite(AUGER_STEP, HIGH);
-      digitalWrite(AUGER_STEP, LOW);
-      delayMicroseconds(STEP_DELAY);
-    }
-    digitalWrite(AUGER_DIR, HIGH);
-    for (int i = 0; i < 400; i++) {
-      digitalWrite(AUGER_STEP, HIGH);
-      digitalWrite(AUGER_STEP, LOW);
-      delayMicroseconds(STEP_DELAY);
-    }
-    digitalWrite(AUGER_DIR, LOW);
-    for (int i = 0; i < 100; i++) {
-      digitalWrite(AUGER_STEP, HIGH);
-      digitalWrite(AUGER_STEP, LOW);
+    digitalWrite(PIN_AUGER_DIR, AUGER_DIR_CCW);
+    for (int i = 0; !stop && i < 800; i++) {
+      digitalWrite(PIN_AUGER_STEP, HIGH);
+      digitalWrite(PIN_AUGER_STEP, LOW);
       delayMicroseconds(STEP_DELAY);
     }
   }
-  digitalWrite(AUGER_EN, HIGH);
-  ret = 1;
-  
-  return (ret);
+  shutdownAuger();
+  return(curWeight - startWeight);
+}
+
+void
+shutdownDoor(void)
+{
+  digitalWrite(PIN_DOOR_EN, HIGH);
+}
+void
+shutdownAuger(void)
+{
+  digitalWrite(PIN_AUGER_EN, HIGH);
+}
+void
+enableDoor(void)
+{
+  digitalWrite(PIN_DOOR_EN, LOW);
+}
+void
+enableAuger(void)
+{
+  digitalWrite(PIN_AUGER_EN, LOW);
 }
 
 float
@@ -454,7 +478,6 @@ weigh(bool doAverage)
   static float    weight[100];
   static uint8_t  pos=0;
   float           total;
-  uint8_t         samples = 0;
 
   if (pos == 100)
     pos = 0;
@@ -465,11 +488,8 @@ weigh(bool doAverage)
   
   pos++;
   for (int i = 0; i < 100; i++)
-    if (weight[i]) {
       total += weight[i];
-      samples++;
-    }
-  return(total / samples);
+  return(total / 100);
 }
 
 void
@@ -521,9 +541,8 @@ defaultSettings(void)
 {
   byte            addr[8];
   // Do not clear calibration data 
-  memset(&conf, '\0', sizeof(struct cfg));
-  conf.scale = SCALE_FACTOR;
-  conf.offset = SCALE_OFFSET;
+  memset(&conf.hostname, '\0', sizeof(struct cfg) - (offsetof(struct cfg, hostname) - offsetof(struct cfg, magic)));
+  WiFi.macAddress().toCharArray(conf.hostname, 32);
   conf.magic = MAGIC;
 }
 
@@ -588,10 +607,11 @@ wshandleRoot(void) {
       "<h1>Feeder %s</h1>"
       "<p>Uptime: %02d:%02d:%02d</p>"
       "<p>Weight: %6.2f</p>"
+      "<p>Dispensed: %6.2f</p>"
       "<p>"
       "<a href='/config'>System Configuration</a>"
       "<form method='post' action='/feed' name='Feed'/>\n"
-        "<label for='weight'>Dispense gramms:</label><input name='weight' type='number' value='10' min='1' max='60'>\n"
+        "<label for='weight'>Dispense grams:</label><input name='weight' type='number' value='%d' min='1' max='60'>\n"
         "<input name='Feed' type='submit' value='Feed'>\n"
       "</form>"
       "<p><font size=1>Firmware: " __DATE__ " " __TIME__ "<br>Config Size: %d<br>"
@@ -600,7 +620,7 @@ wshandleRoot(void) {
       "</body>"
     "</html>",
     conf.hostname, conf.hostname,
-    hr, min % 60, sec % 60, weigh(true), sizeof(struct cfg), conf.offset, conf.scale
+    hr, min % 60, sec % 60, weigh(true), dispensedTotal, conf.perFeed, sizeof(struct cfg), conf.offset, conf.scale
   );
   webserver.send(200, "text/html", body);
 }
@@ -661,12 +681,14 @@ wshandleConfig(void)
     "<h1>Feeder %s</h1>"
     "<form method='post' action='/save' name='Configuration'/>\n"
         "<label for='name'>Feeder Name:</label><input name='name' type='text' value='%s' size='32' maxlength='32' "
-          "pattern='^[A-Za-z0-9_-]+$' title='Letters, numbers, _ and -'><br><br>\n"
-        "<label for='ssid'>SSID:</label><input name='ssid' type='text' value='%s' size='32' maxlength='63'><br><br>\n"
-        "<label for='key'>WPA Key:</label><input name='key' type='text' value='%s' size='32' maxlength='63'><br><br>\n"
+          "pattern='^[A-Za-z0-9_-]+$' title='Letters, numbers, _ and -'><br>\n"
+        "<label for='ssid'>SSID:</label><input name='ssid' type='text' value='%s' size='32' maxlength='63'><br>\n"
+        "<label for='key'>WPA Key:</label><input name='key' type='text' value='%s' size='32' maxlength='63'><br>\n"
         "<label for='ntp'>NTP Server:</label><input name='ntp' type='text' value='%s' size='32' maxlength='63' "
-          "pattern='^([a-z0-9]+)(\\.)([_a-z0-9]+)((\\.)([_a-z0-9]+))?$' title='A valid hostname'><br><br>\n",
-        conf.hostname, conf.hostname, conf.hostname, conf.ssid, conf.wpakey, conf.ntpserver);
+          "pattern='^([a-z0-9]+)(\\.)([_a-z0-9]+)((\\.)([_a-z0-9]+))?$' title='A valid hostname'><br>\n"
+        "<label for=quota'>Daily quota:</label><input name='quota' type='number' value='%d' min='10' max='120'><br>\n"
+        "<label for=perfeed'>Per feed:</label><input name='perfeed' type='number' value='%d' min='1' max='25'><br><br>\n",
+        conf.hostname, conf.hostname, conf.hostname, conf.ssid, conf.wpakey, conf.ntpserver, conf.quota, conf.perFeed);
 
   for (int i = 0; i < CFG_NCATS; i++) {
     snprintf(temp, 600,
@@ -699,38 +721,46 @@ wshandleSave(void)
   char  temp[400];
   String value;
 
-  value = webserver.arg("ssid");
-  if (value.length()) {
+  if (webserver.hasArg("ssid")) {
+    value = webserver.arg("ssid");
     strncpy(temp, value.c_str(), 399);
     urlDecode(temp);
     strncpy(conf.ssid, temp, 63);
   }
 
-  value = webserver.arg("key");
-  if (value.length()) {
+  if (webserver.hasArg("key")) {
+    value = webserver.arg("key");
     strncpy(temp, value.c_str(), 399);
     urlDecode(temp);
     strncpy(conf.wpakey, temp, 63);
   }
 
-  value = webserver.arg("name");
-  if (value.length()) {
+  if (webserver.hasArg("name")) {
+    value = webserver.arg("name");
     strncpy(temp, value.c_str(), 399);
     urlDecode(temp);
     strncpy(conf.hostname, temp, 32);
   }
 
-  value = webserver.arg("ntp");
-  if (value.length()) {
+  if (webserver.hasArg("ntp")) {
+    value = webserver.arg("ntp");
     strncpy(temp, value.c_str(), 399);
     urlDecode(temp);
     strncpy(conf.ntpserver, temp, 32);
   }
 
+  value = webserver.arg("quota");
+  if (value.length() && value.toInt() >= 10 && value.toInt() <= 120)
+    conf.quota = value.toInt();
+
+  value = webserver.arg("perfeed");
+  if (value.length() && value.toInt() >= 1 && value.toInt() <= 25)
+    conf.perFeed = value.toInt();
+
   for (int i=0; i < CFG_NCATS; i++) {
     snprintf(temp, 399, "catname%d", i);
-    value = webserver.arg(temp);
-    if (value.length()) {
+    if (webserver.hasArg(temp)) {
+      value = webserver.arg(temp);
       strncpy(temp, value.c_str(), 399);
       urlDecode(temp);
       strncpy(conf.cat[i].name, temp, 20);
@@ -806,7 +836,7 @@ wshandleDoFeed()
   webserver.send(200, "text/html", temp);
   
   if (weight)
-    dispense(weight);
+    dispensedTotal += dispense(weight);
 }
 
 void
