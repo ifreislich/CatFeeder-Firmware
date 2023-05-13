@@ -801,7 +801,7 @@ wshandleSave(void)
     conf.perFeed = value.toInt();
 
   value = webserver.arg("cooloff");
-  if (value.length() && value.toInt() >= 1 && value.toInt() <= 25)
+  if (value.length() && value.toInt() >= 0 && value.toInt() <= 120)
     conf.cooloff = value.toInt();
 
   for (int i=0; i < CFG_NCATS; i++) {
