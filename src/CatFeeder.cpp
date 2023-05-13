@@ -36,6 +36,7 @@
 #include <FastCRC.h>
 #include <HX711.h>
 #include <esp_sntp.h>
+#include <RTClib.h>
 #include <time.h>
 #include <sys/time.h>
 #include <stdarg.h>
@@ -63,6 +64,7 @@ struct cfg {
   char      pad;
   uint8_t   perFeed;
   uint8_t   quota;
+  uint8_t   cooloff;
   uint16_t  crc;
 } __attribute__((__packed__));
 
@@ -106,7 +108,7 @@ const int   daylightOffset_sec = 0 * 3600;
 // Bitmap States
 #define STATE_OPEN          0x01
 #define STATE_WEIGHTREPORT  0x02
-#define STATE_3             0x04
+#define STATE_RTC           0x04
 #define STATE_4             0x08
 
 volatile unsigned char  databits[MAX_BITS];    // stores all of the data bits
@@ -116,7 +118,7 @@ volatile uint32_t       weigand_counter;       // countdown until we assume ther
 
 uint8_t       state = 0;
 time_t        closeTime = 0, lastFeed = 0;
-float         dispensedTotal = 0;
+RTC_NOINIT_ATTR float   dispensedTotal;
 struct cfg    conf;
 
 void wshandleRoot(void);
@@ -168,6 +170,7 @@ void IRAM_ATTR ISR_D1(void)
 #define PIN_HX711_RATE  33
 HX711     scale;
 WebServer webserver(80);
+RTC_DS3231 rtc;
 
 void
 setup()
@@ -223,19 +226,26 @@ setup()
   MDNS.begin(hostname);
   MDNS.addService("http", "tcp", 80);
 
-/*
-  if(ds_rtc.lostPower()) {
-    Serial.println(F("RTC lost power"));
+  if (rtc.begin()) {
+    state |= STATE_RTC;
+    rtc.disable32K();
+    rtc.writeSqwPinMode(DS3231_OFF);
+    rtc.clearAlarm(1);
+    rtc.clearAlarm(2);
+    if (rtc.lostPower()) {
+      debug(false, "RTC lost power");
+    }
+    else {
+      DateTime now = rtc.now();
+      tv.tv_sec = now.unixtime();
+      tv.tv_usec = 0;
+      settimeofday(&tv, &tz);
+    }
   }
   else {
-    Serial.println(F("RTC OK"));
+    debug(false, "No RTC found");
+    state &= ~STATE_RTC;
   }
-
-  DateTime now = rtc.now();
-  tv.tv_sec = now.unixtime();
-  tv.tv_usec = 0;
-  settimeofday(&tv, &tz);
- */
 
   pinMode(PIN_HX711_RATE, 0); // 0: 10Hz, 1: 80Hz
   scale.begin(PIN_HX711_DATA, PIN_HX711_CLK);
@@ -246,6 +256,11 @@ setup()
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   sntp_set_time_sync_notification_cb(ntpCallBack);
   
+  if (esp_reset_reason() != ESP_RST_SW) {
+      dispensedTotal = 0;
+      debug(true, "Resetting dispensed total counter");
+  }
+
   ArduinoOTA.setHostname(hostname);
   ArduinoOTA
   .onStart([]() {
@@ -441,7 +456,11 @@ openDoor(void)
 float
 dispense(int grams)
 {
-  float startWeight = weigh(false), curWeight;
+  static time_t   lastFeed = time(NULL) - conf.cooloff * 60;
+  float           startWeight = weigh(false), curWeight;
+
+  if (time(NULL) - conf.cooloff * 60 > lastFeed || dispensedTotal >= conf.quota)
+    return(0);
 
   debug(true, "Dispense %dg", grams);
   enableAuger();
@@ -516,13 +535,15 @@ weigh(bool doAverage)
 void
 ntpCallBack(struct timeval *tv)
 {
-  char timestr[20];
+  char      timestr[20];
   struct tm *tm = localtime(&tv->tv_sec);
+  DateTime  now(tm->tm_year, tm->tm_mon, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec);
   
   strftime(timestr, 20, "%F %T", tm);
   debug(true, "ntp: %s", timestr);
 
-  //rtc.adjust(now);
+  if (state & STATE_RTC)
+    rtc.adjust(now);
 }
 
 void
@@ -690,7 +711,7 @@ wshandle404(void) {
 void
 wshandleConfig(void)
 {
-  char  body[5120], temp[600];
+  char  body[5520], temp[600];
   
   snprintf(body, 2000,
     "<html>\n"
@@ -708,8 +729,9 @@ wshandleConfig(void)
         "<label for='ntp'>NTP Server:</label><input name='ntp' type='text' value='%s' size='32' maxlength='63' "
           "pattern='^([a-z0-9]+)(\\.)([_a-z0-9]+)((\\.)([_a-z0-9]+))?$' title='A valid hostname'><br>\n"
         "<label for=quota'>Daily quota:</label><input name='quota' type='number' value='%d' min='10' max='120'><br>\n"
-        "<label for=perfeed'>Per feed:</label><input name='perfeed' type='number' value='%d' min='1' max='25'><br><br>\n",
-        conf.hostname, conf.hostname, conf.hostname, conf.ssid, conf.wpakey, conf.ntpserver, conf.quota, conf.perFeed);
+        "<label for=perfeed'>Per feed:</label><input name='perfeed' type='number' value='%d' min='1' max='25'><br>\n"
+        "<label for=cooloff'>Feed cooloff (minutes):</label><input name='cooloff' type='number' value='%d' min='0' max='120'><br><br>\n",
+        conf.hostname, conf.hostname, conf.hostname, conf.ssid, conf.wpakey, conf.ntpserver, conf.quota, conf.perFeed, conf.cooloff);
 
   for (int i = 0; i < CFG_NCATS; i++) {
     snprintf(temp, 600,
@@ -777,6 +799,10 @@ wshandleSave(void)
   value = webserver.arg("perfeed");
   if (value.length() && value.toInt() >= 1 && value.toInt() <= 25)
     conf.perFeed = value.toInt();
+
+  value = webserver.arg("cooloff");
+  if (value.length() && value.toInt() >= 1 && value.toInt() <= 25)
+    conf.cooloff = value.toInt();
 
   for (int i=0; i < CFG_NCATS; i++) {
     snprintf(temp, 399, "catname%d", i);
