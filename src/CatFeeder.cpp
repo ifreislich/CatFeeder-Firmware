@@ -118,7 +118,9 @@ volatile uint32_t       weigand_counter;       // countdown until we assume ther
 
 uint8_t       state = 0;
 time_t        closeTime = 0, lastFeed = 0;
-RTC_NOINIT_ATTR float   dispensedTotal;
+RTC_NOINIT_ATTR float     dispensedTotal;
+RTC_NOINIT_ATTR time_t    lastDispense;
+RTC_NOINIT_ATTR uint32_t  magic;
 struct cfg    conf;
 
 void wshandleRoot(void);
@@ -256,9 +258,11 @@ setup()
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   sntp_set_time_sync_notification_cb(ntpCallBack);
   
-  if (esp_reset_reason() != ESP_RST_SW) {
+  if (magic != MAGIC) {
       dispensedTotal = 0;
-      debug(true, "Resetting dispensed total counter");
+      lastDispense = time(NULL) - conf.cooloff * 60;
+      magic = MAGIC;
+      debug(true, "Resetting persistent records");
   }
 
   ArduinoOTA.setHostname(hostname);
@@ -456,10 +460,9 @@ openDoor(void)
 float
 dispense(int grams)
 {
-  static time_t   lastFeed = time(NULL) - conf.cooloff * 60;
   float           startWeight = weigh(false), curWeight;
 
-  if (time(NULL) - conf.cooloff * 60 > lastFeed || dispensedTotal >= conf.quota)
+  if (time(NULL) < lastDispense + conf.cooloff * 60 || dispensedTotal >= conf.quota)
     return(0);
 
   debug(true, "Dispense %dg", grams);
@@ -488,6 +491,7 @@ dispense(int grams)
     }
   }
   shutdownAuger();
+  lastDispense = time(NULL);
   return(curWeight - startWeight);
 }
 
