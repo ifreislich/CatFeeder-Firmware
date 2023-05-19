@@ -45,6 +45,7 @@
 
 #define MAGIC 0xd41d8cd5
 #define CFG_NCATS 7
+#define CFG_NSCHEDULES 10
 struct cfg {
   uint32_t  magic;
   float     scale;
@@ -65,22 +66,27 @@ struct cfg {
   uint8_t   perFeed;
   uint8_t   quota;
   uint8_t   cooloff;
+  struct {
+    uint8_t hour;
+    uint8_t minute;
+    uint8_t weight;
+    uint8_t flags;
+  } schedule[CFG_NSCHEDULES];
   uint16_t  crc;
 } __attribute__((__packed__));
 
 // Bitmap Configuration Flags
-#define CFG_ACCESS    0x01
-#define CFG_DISPENSE  0x02
+#define CFG_CAT_ACCESS    0x01
+#define CFG_CAT_DISPENSE  0x02
+
+#define CFG_SCHED_ENABLE  0x01
+#define CFG_SCHED_SKIP    0x02
 
 #define SCALE_FACTOR 247.408408f
 #define SCALE_OFFSET 62236
 
-const char* ntpServer = "pool.ntp.org";
-const int   gmtOffset_sec = -4 * 3600;
-const int   daylightOffset_sec = 0 * 3600;
-
-#define CLOSE_LIMIT 17
-#define OPEN_LIMIT  5
+#define PIN_CLOSE_LIMIT 17
+#define PIN_OPEN_LIMIT  5
 #define LOGPORT     5001
 
 #define PIN_AUGER_EN        13
@@ -105,19 +111,24 @@ const int   daylightOffset_sec = 0 * 3600;
 #define WEIGAND_TIMEOUT 20     // timeout in ms on Wiegand sequence 
 #define DOOR_TIMEOUT    60        // Door stays unlocked for max X seconds
 
+#define PIN_RTC_INTR    19
+
 // Bitmap States
 #define STATE_OPEN          0x01
 #define STATE_WEIGHTREPORT  0x02
-#define STATE_RTC           0x04
-#define STATE_4             0x08
+#define STATE_RTC_PRESENT   0x04
+#define STATE_RTC_INTR      0x08
+#define STATE_GOT_TIME      0x0F
+#define STATE_CHECK_HOPPER  0x10
+#define STATE_NO_SCHEDULE   0x20
 
 volatile unsigned char  databits[MAX_BITS];    // stores all of the data bits
 volatile unsigned char  bitCount;              // number of bits currently captured
 volatile unsigned char  flagDone;              // goes low when data is currently being captured
 volatile uint32_t       weigand_counter;       // countdown until we assume there are no more bits
 
-uint8_t       state = 0;
 time_t        closeTime = 0, lastFeed = 0;
+RTC_NOINIT_ATTR uint8_t   state;
 RTC_NOINIT_ATTR float     dispensedTotal;
 RTC_NOINIT_ATTR time_t    lastDispense;
 RTC_NOINIT_ATTR uint32_t  magic;
@@ -132,6 +143,8 @@ void wshandleReboot(void);
 void wshandleCalibrate(void);
 void wshandleDoCalibrate(void);
 void wshandleTare(void);
+void wshandleSchedule(void);
+void wshandleScheduleSave(void);
 
 int checkCard(uint8_t, uint16_t);
 const char *catName(uint8_t, uint16_t);
@@ -150,6 +163,10 @@ void shutdownDoor(void);
 void shutdownAuger(void);
 void enableDoor(void);
 void enableAuger(void);
+uint8_t getNextAlarm(void);
+uint8_t getCurrentAlarm(void);
+void setAlarm(uint8_t);
+TimeSpan getTz(void);
 
 // interrupt that happens when INTO goes low (0 bit)
 void IRAM_ATTR ISR_D0(void)
@@ -167,6 +184,11 @@ void IRAM_ATTR ISR_D1(void)
   weigand_counter = millis() + WEIGAND_TIMEOUT;
 }
 
+void IRAM_ATTR ISR_RTC(void)
+{
+  state |= STATE_RTC_INTR;
+}
+
 #define PIN_HX711_CLK   32
 #define PIN_HX711_DATA  34  // This is an input only pin without pullup.
 #define PIN_HX711_RATE  33
@@ -177,11 +199,50 @@ RTC_DS3231 rtc;
 void
 setup()
 {
-  char  hostname[28];
-  timeval tv;
-  timezone tz = {0, 0};
-  
+  char      hostname[28];
+  timeval   tv;
+
   delay(100);
+  Serial.begin(115200);
+  configInit();
+  if (magic != MAGIC) {
+      dispensedTotal = 0;
+      state = 0;
+      lastDispense = time(NULL) - conf.cooloff * 60;
+      magic = MAGIC;
+      debug(true, "Resetting persistent records");
+  }
+  if (rtc.begin()) {
+    state |= STATE_RTC_PRESENT;
+    rtc.disable32K();
+    rtc.writeSqwPinMode(DS3231_OFF);
+    rtc.clearAlarm(1);
+    rtc.clearAlarm(2);
+    if (rtc.lostPower()) {
+      debug(false, "RTC lost power");
+    }
+    else {
+      DateTime now = rtc.now();
+      tv.tv_sec = now.unixtime();
+      tv.tv_usec = 0;
+      settimeofday(&tv, NULL);
+      state |= STATE_GOT_TIME;
+    }
+  }
+  else {
+    state &= ~STATE_RTC_PRESENT;
+    debug(false, "No RTC found");
+  }
+  configTzTime("EST5EDT,M3.2.0,M11.1.0", conf.ntpserver);
+  sntp_set_time_sync_notification_cb(ntpCallBack);
+
+  //RTC is in UTC
+  DateTime alarm2(__DATE__, "00:00:00");
+  rtc.setAlarm2(alarm2 - getTz(), DS3231_A2_Hour);
+  setAlarm(getNextAlarm());
+  pinMode(PIN_RTC_INTR, INPUT_PULLUP);
+  attachInterrupt(PIN_RTC_INTR, ISR_RTC, FALLING);
+
   pinMode(PIN_AUGER_EN, OUTPUT);
   digitalWrite(PIN_AUGER_EN, HIGH);
   pinMode(PIN_AUGER_SLEEP, OUTPUT);
@@ -202,13 +263,11 @@ setup()
 
   pinMode(PIN_DATA0, INPUT);
   pinMode(PIN_DATA1, INPUT);
-  pinMode(CLOSE_LIMIT, INPUT);
-  pinMode(OPEN_LIMIT, INPUT);
-  if (!digitalRead(CLOSE_LIMIT))
+  pinMode(PIN_CLOSE_LIMIT, INPUT);
+  pinMode(PIN_OPEN_LIMIT, INPUT);
+  if (!digitalRead(PIN_CLOSE_LIMIT))
     state |= STATE_OPEN;
 
-  Serial.begin(115200);
-  configInit();
   //connect to WiFi
   WiFi.onEvent(wifiEvent, ARDUINO_EVENT_WIFI_STA_CONNECTED);
   WiFi.onEvent(wifiEvent, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
@@ -220,50 +279,19 @@ setup()
   strcpy(hostname, "CatFeeder-");
   strcat(hostname, conf.hostname);
   if (WiFi.setHostname(hostname))
-    debug(false, "Set hostname to '%s'", hostname);
+    debug(true, "Set hostname to '%s'", hostname);
   else
-    debug(false, "Hostname failed");
+    debug(true, "Hostname failed");
   
   WiFi.begin(conf.ssid, conf.wpakey);
   MDNS.begin(hostname);
   MDNS.addService("http", "tcp", 80);
-
-  if (rtc.begin()) {
-    state |= STATE_RTC;
-    rtc.disable32K();
-    rtc.writeSqwPinMode(DS3231_OFF);
-    rtc.clearAlarm(1);
-    rtc.clearAlarm(2);
-    if (rtc.lostPower()) {
-      debug(false, "RTC lost power");
-    }
-    else {
-      DateTime now = rtc.now();
-      tv.tv_sec = now.unixtime();
-      tv.tv_usec = 0;
-      settimeofday(&tv, &tz);
-    }
-  }
-  else {
-    debug(false, "No RTC found");
-    state &= ~STATE_RTC;
-  }
 
   pinMode(PIN_HX711_RATE, 0); // 0: 10Hz, 1: 80Hz
   scale.begin(PIN_HX711_DATA, PIN_HX711_CLK);
   scale.set_scale(conf.scale);
   scale.set_offset(conf.offset);
   state &= ~STATE_WEIGHTREPORT;
-  //init and get the time
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  sntp_set_time_sync_notification_cb(ntpCallBack);
-  
-  if (magic != MAGIC) {
-      dispensedTotal = 0;
-      lastDispense = time(NULL) - conf.cooloff * 60;
-      magic = MAGIC;
-      debug(true, "Resetting persistent records");
-  }
 
   ArduinoOTA.setHostname(hostname);
   ArduinoOTA
@@ -281,12 +309,13 @@ setup()
     debug(true, "Rebooting");
   })
   .onProgress([](unsigned int progress, unsigned int total) {
-    debug(false, "Received: %7d of %7d", progress, total);
+    if (!(progress % 73728))
+      debug(false, "Received: %7d of %7d", progress, total);
   })
   .onError([](ota_error_t error) {
     debug(true, "Error[%u]: ", error);
     if (error == OTA_AUTH_ERROR) debug(false, "Auth Failed");
-    else if (error == OTA_BEGIN_ERROR) debug(false, "Begin Faile");
+    else if (error == OTA_BEGIN_ERROR) debug(false, "Begin Failed");
     else if (error == OTA_CONNECT_ERROR) debug(false, "Connect Failed");
     else if (error == OTA_RECEIVE_ERROR) debug(false, "Receive Failed");
     else if (error == OTA_END_ERROR) debug(false, "End Failed");
@@ -300,6 +329,8 @@ setup()
   webserver.on("/calibrate", wshandleCalibrate);
   webserver.on("/docalibrate", wshandleDoCalibrate);
   webserver.on("/tare", wshandleTare);
+  webserver.on("/schedule", wshandleSchedule);
+  webserver.on("/schedulesave", wshandleScheduleSave);
   webserver.onNotFound(wshandle404);
   webserver.begin();
   ArduinoOTA.begin();
@@ -313,17 +344,44 @@ setup()
 void
 loop()
 {
-  uint8_t   facilityCode = 0;      // decoded facility code
+  uint8_t   facilityCode = 0, alarmIdx;      // decoded facility code
   uint16_t  cardCode = 0;          // decoded card code
   
   ArduinoOTA.handle();
   webserver.handleClient();
+
+  if (state & STATE_RTC_INTR) {
+    state &= ~STATE_RTC_INTR;
+    if (rtc.alarmFired(1)) {
+      uint8_t feedWeight;
+      rtc.clearAlarm(1);
+      alarmIdx = getCurrentAlarm();
+      if (conf.schedule[alarmIdx].weight)
+        feedWeight = conf.schedule[alarmIdx].weight;
+      else
+        feedWeight = conf.perFeed;
+
+      // We may already have dispensed the quota but that will 
+      // be caught later.
+      if (dispensedTotal + feedWeight > conf.quota)
+        feedWeight = abs(conf.quota - dispensedTotal);
+
+      if (!(conf.schedule[alarmIdx].flags & CFG_SCHED_SKIP && weigh(true) > feedWeight / 2))
+        dispensedTotal += dispense(feedWeight);
+      setAlarm(getNextAlarm()); 
+    }
+    if (rtc.alarmFired(2)) {
+      rtc.clearAlarm(2);
+      dispensedTotal = 0;
+      debug(true, "Reset dispensed total");
+    }
+  }
   
-  if ((~state & STATE_OPEN) && digitalRead(CLOSE_LIMIT) && time(NULL) > DOOR_TIMEOUT + closeTime)
+  if ((~state & STATE_OPEN) && digitalRead(PIN_CLOSE_LIMIT) && time(NULL) > DOOR_TIMEOUT + closeTime)
     openDoor();
   // If the door is supposed to be closed but the limit switch doesn't read closed,
   // Attempt to re-close the door
-  if ((~state & STATE_OPEN) && !digitalRead(CLOSE_LIMIT)) {
+  if ((~state & STATE_OPEN) && !digitalRead(PIN_CLOSE_LIMIT)) {
     debug(true, "Door should be closed, reclosing");
     closeDoor();
   }
@@ -393,14 +451,14 @@ checkCard(uint8_t facilityCode, uint16_t cardCode)
     closeDoor();
     return(0);
   }
-  if (conf.cat[i].flags & CFG_ACCESS) {
+  if (conf.cat[i].flags & CFG_CAT_ACCESS) {
     lastFeed = time(NULL);
     state |= STATE_WEIGHTREPORT;
     debug(true, "Authorized: %s", catName(facilityCode, cardCode));
     if (~state & STATE_OPEN)
       openDoor();
   }
-  else if (conf.cat[i].flags & CFG_DISPENSE)
+  else if (conf.cat[i].flags & CFG_CAT_DISPENSE)
     dispensedTotal += dispense(conf.perFeed);
   else
     closeDoor();
@@ -427,12 +485,12 @@ closeDoor(void)
   int   i;
 
   closeTime = time(NULL);
-  if (digitalRead(CLOSE_LIMIT) && ~state & STATE_OPEN) // Just reset the open timer if the door is closed
+  if (digitalRead(PIN_CLOSE_LIMIT) && ~state & STATE_OPEN) // Just reset the open timer if the door is closed
     return;
   debug(true, "Closing");
   digitalWrite(PIN_DOOR_DIR, DOOR_DIR_CLOSE);
   enableDoor();
-  for (i = 0; !digitalRead(CLOSE_LIMIT); i++) {
+  for (i = 0; i < 3000 && !digitalRead(PIN_CLOSE_LIMIT); i++) {
     digitalWrite(PIN_DOOR_STEP, HIGH);
     digitalWrite(PIN_DOOR_STEP, LOW);
     delayMicroseconds(1200);
@@ -447,7 +505,7 @@ openDoor(void)
   debug(true, "Opening");
   digitalWrite(PIN_DOOR_DIR, DOOR_DIR_OPEN);
   enableDoor();
-  for (int i = 0; i < 2650 && !digitalRead(OPEN_LIMIT); i++) {
+  for (int i = 0; i < 3000 && !digitalRead(PIN_OPEN_LIMIT); i++) {
     digitalWrite(PIN_DOOR_STEP, HIGH);
     digitalWrite(PIN_DOOR_STEP, LOW);
     delayMicroseconds(1200);
@@ -462,7 +520,7 @@ dispense(int grams)
 {
   float           startWeight = weigh(false), curWeight;
 
-  if (time(NULL) < lastDispense + conf.cooloff * 60 || dispensedTotal >= conf.quota)
+  if (~state & STATE_CHECK_HOPPER && (time(NULL) < lastDispense + conf.cooloff * 60 || dispensedTotal >= conf.quota))
     return(0);
 
   debug(true, "Dispense %dg", grams);
@@ -478,10 +536,12 @@ dispense(int grams)
       digitalWrite(PIN_AUGER_STEP, LOW);
       delayMicroseconds(STEP_DELAY);
       // Weigh every 45 degrees rotation
-      if (i % 400 == 0)
+      if (i % 400 == 0) {
         curWeight = weigh(false);
-      if (i % 400 == 0 && curWeight - startWeight > grams)
-        stop = 1;
+        if (curWeight - startWeight > grams)
+          stop = 1;
+        webserver.handleClient();
+      }
     }
     digitalWrite(PIN_AUGER_DIR, AUGER_DIR_CCW);
     for (int i = 0; !stop && i < 800; i++) {
@@ -492,6 +552,7 @@ dispense(int grams)
   }
   shutdownAuger();
   lastDispense = time(NULL);
+  abs(grams - (curWeight - startWeight)) > 3 ? state |= STATE_CHECK_HOPPER : state &= ~STATE_CHECK_HOPPER;
   return(curWeight - startWeight);
 }
 
@@ -539,14 +600,11 @@ weigh(bool doAverage)
 void
 ntpCallBack(struct timeval *tv)
 {
-  char      timestr[20];
-  struct tm *tm = localtime(&tv->tv_sec);
-  DateTime  now(tm->tm_year, tm->tm_mon, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec);
+  DateTime  now(tv->tv_sec);
   
-  strftime(timestr, 20, "%F %T", tm);
-  debug(true, "ntp: %s", timestr);
+  state |= STATE_GOT_TIME;
 
-  if (state & STATE_RTC)
+  if (state & STATE_RTC_PRESENT)
     rtc.adjust(now);
 }
 
@@ -611,6 +669,68 @@ configInit(void)
   scale.set_offset(conf.offset);
 }
 
+uint8_t
+getNextAlarm(void)
+{
+  time_t      t = time(NULL);
+  struct tm  *tm = localtime(&t);
+  int         i;
+
+  for (i = 0; i < CFG_NSCHEDULES; i++) {
+    if (~conf.schedule[i].flags & CFG_SCHED_ENABLE)
+      continue;
+    if (tm->tm_hour * 60 + tm->tm_min < conf.schedule[i].hour * 60 + conf.schedule[i].minute)
+      break;
+  }
+
+  if (i == CFG_NSCHEDULES)
+    for (i = 0; i < CFG_NSCHEDULES && ~conf.schedule[i].flags & CFG_SCHED_ENABLE; i++);
+  debug(true, "Schedule %d", i);
+  return(i);
+}
+
+uint8_t
+getCurrentAlarm(void)
+{
+  DateTime  alarm1;
+  int       i;
+
+  alarm1 = rtc.getAlarm1() + getTz();
+
+  for (i = 0; i < CFG_NSCHEDULES; i++) {
+    if (~conf.schedule[i].flags & CFG_SCHED_ENABLE)
+      continue;
+    if (alarm1.hour() == conf.schedule[i].hour && alarm1.minute() == conf.schedule[i].minute)
+      break;
+  }
+  return(i);
+}
+
+void
+setAlarm(uint8_t alarm)
+{
+  if (alarm >= CFG_NSCHEDULES) {
+    state |= STATE_NO_SCHEDULE;
+    return;
+  }
+  state &= ~STATE_NO_SCHEDULE;
+
+  DateTime  alarm1(2000, 1, 1, conf.schedule[alarm].hour, conf.schedule[alarm].minute, 0);
+  rtc.setAlarm1(alarm1 - getTz(), DS3231_A1_Hour);
+}
+
+TimeSpan
+getTz(void)
+{
+    time_t    t;
+    struct tm *tm;
+    TimeSpan  tz;
+    t = time(NULL);
+    tm = gmtime(&t);
+    tz = t - mktime(tm) + (tm->tm_isdst ? 3600 : 0);
+    return(tz);
+}
+
 void
 debug(byte logtime, const char *format, ...)
 {
@@ -621,11 +741,11 @@ debug(byte logtime, const char *format, ...)
   struct tm *tm = localtime(&t);
   
   va_start(pvar, format);
-    if (logtime) {
-      strftime(timestr, 20, "%F %T", tm);
-      Serial.print(timestr);
-      Serial.print(": "); 
-    }
+  if (logtime && state | STATE_GOT_TIME) {
+    strftime(timestr, 20, "%F %T", tm);
+    Serial.print(timestr);
+    Serial.print(": "); 
+  }
   vsnprintf(str, 60, format, pvar);
   Serial.println(str);
   va_end(pvar);
@@ -637,12 +757,18 @@ debug(byte logtime, const char *format, ...)
 
 void
 wshandleRoot(void) {
-  char body[1024];
+  char body[1920];
   int sec = millis() / 1000;
   int min = sec / 60;
   int hr = min / 60;
+  char alarm1Date[9] = "hh:mm:ss";
 
-  snprintf(body, 1024,
+  if (~state & STATE_NO_SCHEDULE) {
+    DateTime alarm1 = rtc.getAlarm1() + getTz();
+    alarm1.toString(alarm1Date);
+  }
+
+  snprintf(body, 1920,
     "<html>"
     "<head>"
     "<meta http-equiv='refresh' content='20'/>"
@@ -651,22 +777,30 @@ wshandleRoot(void) {
     "</head>"
     "<body>"
       "<h1>Feeder %s</h1>"
-      "<p>Uptime: %02d:%02d:%02d</p>"
-      "<p>Weight: %6.2f</p>"
-      "<p>Dispensed: %6.2f</p>"
-      "<p>"
-      "<a href='/config'>System Configuration</a>"
+      "%s"
+      "<p>Next dispense: %s</p>"
+      "<p>Weight: %3.0f g</p>"
+      "<p>Dispensed: %3.0f of %3d g</p>"
+      "<p><a href='/config'>System Configuration</a></p>"
+      "<p><a href='/schedule'>Feed Dispensing Schedule</a></p>"
       "<form method='post' action='/feed' name='Feed'/>\n"
-        "<label for='weight'>Dispense grams:</label><input name='weight' type='number' value='%d' min='1' max='60'>\n"
+        "<label for='weight'>Dispense grams:</label><input name='weight' type='number' size='3' value='%d' min='1' max='25'>\n"
         "<input name='Feed' type='submit' value='Feed'>\n"
       "</form>"
-      "<p><font size=1>Firmware: " __DATE__ " " __TIME__ "<br>Config Size: %d<br>"
+      "<p><font size=1>"
+      "Uptime: %02d:%02d:%02d<br>"
+      "Firmware: " __DATE__ " " __TIME__ "<br>"
+      "Config Size: %d<br>"
       "offset: %ld<br>"
       "factor: %f</font>\n"
       "</body>"
     "</html>",
     conf.hostname, conf.hostname,
-    hr, min % 60, sec % 60, weigh(true), dispensedTotal, conf.perFeed, sizeof(struct cfg), conf.offset, conf.scale
+    state & STATE_CHECK_HOPPER ? "<p style='color: #AA0000;'>Check Hopper</p>" : "",
+    ~state & STATE_NO_SCHEDULE ? alarm1Date : "No Schedule",
+    weigh(true), dispensedTotal, conf.quota, conf.perFeed,
+    hr, min % 60, sec % 60,
+    sizeof(struct cfg), conf.offset, conf.scale
   );
   webserver.send(200, "text/html", body);
 }
@@ -740,12 +874,12 @@ wshandleConfig(void)
   for (int i = 0; i < CFG_NCATS; i++) {
     snprintf(temp, 600,
       "<label for='catname%d'>Cat %d:</label><input name='catname%d' type='text' value='%s' size='19' maxlength='19'><br>\n"
-      "<label for=facility%d'>Facility Code:</label><input name='facility%d' type='number' value='%d' min='0' max='255'><br>\n"
-      "<label for=id%d'>Tag ID:</label><input name='id%d' type='number' value='%d' min='0' max='8191'><br>\n"
+      "<label for='facility%d'>Facility Code:</label><input name='facility%d' type='number' value='%d' min='0' max='255'><br>\n"
+      "<label for='id%d'>Tag ID:</label><input name='id%d' type='number' value='%d' min='0' max='8191'><br>\n"
       "<label for='access%d'>Access:</label><input name='access%d' type='checkbox' value='true' %s><br>\n"
       "<label for='dispense%d'>Dispense:</label><input name='dispense%d' type='checkbox' value='true' %s><br><br>\n",
-      i, i + 1, i, conf.cat[i].name, i, i, conf.cat[i].facility, i, i, conf.cat[i].id, i, i, conf.cat[i].flags & CFG_ACCESS ? "checked" : "",
-      i, i, conf.cat[i].flags & CFG_DISPENSE ? "checked" : ""
+      i, i + 1, i, conf.cat[i].name, i, i, conf.cat[i].facility, i, i, conf.cat[i].id, i, i, conf.cat[i].flags & CFG_CAT_ACCESS ? "checked" : "",
+      i, i, conf.cat[i].flags & CFG_CAT_DISPENSE ? "checked" : ""
     );
     strcat(body, temp);
   }
@@ -829,15 +963,15 @@ wshandleSave(void)
 
     snprintf(temp, 399, "access%d", i);
     if (webserver.hasArg(temp))
-      conf.cat[i].flags |= CFG_ACCESS;
+      conf.cat[i].flags |= CFG_CAT_ACCESS;
     else
-      conf.cat[i].flags &= ~CFG_ACCESS;
+      conf.cat[i].flags &= ~CFG_CAT_ACCESS;
 
     snprintf(temp, 399, "dispense%d", i);
     if (webserver.hasArg(temp))
-      conf.cat[i].flags |= CFG_DISPENSE;
+      conf.cat[i].flags |= CFG_CAT_DISPENSE;
     else
-      conf.cat[i].flags &= ~CFG_DISPENSE;
+      conf.cat[i].flags &= ~CFG_CAT_DISPENSE;
   }
 
   WiFi.hostname(conf.hostname);
@@ -971,6 +1105,103 @@ wshandleTare(void)
    
   webserver.send(200, "text/html", temp);
 }
+
+void
+wshandleSchedule(void)
+{
+  char  body[5120], temp[600];
+  
+  snprintf(body, 2000,
+    "<html>\n"
+    "<head>\n"
+    "<title>Feeder [%s]</title>\n"
+    "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
+    "</head>\n"
+    "<body>\n"
+    "<h1>Feeder %s</h1>"
+    "<form method='post' action='/schedulesave' name='Schedule'/>\n",
+        conf.hostname, conf.hostname);
+
+  //for (int i = 0; i < CFG_NSCHEDULES; i++) {
+  for (int i = 0; i < 10; i++) {
+    snprintf(temp, 600,
+      "<label for='t%d'>time:</label><input name='t%d' type='time' value='%02d:%02d'><br>\n"
+      "<label for='w%d'>Weight:</label><input name='w%d' type='number' value=%d size=3 min=0 max=25><br>\n"
+      "<label for='e%d'>Enable:</label><input name='e%d' type='checkbox' value='true' %s>\n"
+      "<label for='s%d'>Allow skip:</label><input name='s%d' type='checkbox' value='true' %s><br><br>\n",
+      i, i, conf.schedule[i].hour, conf.schedule[i].minute,
+      i, i, conf.schedule[i].weight,
+      i, i, conf.schedule[i].flags & CFG_SCHED_ENABLE ? "checked" : "",
+      i, i, conf.schedule[i].flags & CFG_SCHED_SKIP ? "checked" : ""
+    );
+    strcat(body, temp);
+  }
+  strcat(body,
+    "<input name='Save' type='submit' value='Save'>\n"
+    "</form>"
+    "<br>"
+    "</body>\n"
+    "</html>");
+
+  webserver.send(200, "text/html", body);
+}
+
+void
+wshandleScheduleSave(void)
+{
+  char  temp[400];
+  String value;
+
+  for (int i=0; i < CFG_NSCHEDULES; i++) {
+    snprintf(temp, 399, "t%d", i);
+    value = webserver.arg(temp);
+    if (value.length()) {
+      int h, m;
+      if (sscanf(value.c_str(), "%d:%d", &h, &m) == 2 ) {
+        if (h >= 0 && h <= 23)
+          conf.schedule[i].hour = h;
+        if (m >= 0 && m <= 59)
+          conf.schedule[i].minute = m;
+      }
+    }
+
+    snprintf(temp, 399, "w%d", i);
+    value = webserver.arg(temp);
+    if (value.length() && value.toInt() >= 0 && value.toInt() <= 25)
+      conf.schedule[i].weight = value.toInt();
+
+    snprintf(temp, 399, "e%d", i);
+    if (webserver.hasArg(temp))
+      conf.schedule[i].flags |= CFG_SCHED_ENABLE;
+    else
+      conf.schedule[i].flags &= ~CFG_SCHED_ENABLE;
+
+    snprintf(temp, 399, "s%d", i);
+    if (webserver.hasArg(temp))
+      conf.schedule[i].flags |= CFG_SCHED_SKIP;
+    else
+      conf.schedule[i].flags &= ~CFG_SCHED_SKIP;
+  }
+
+  snprintf(temp, 400,
+   "<html>\n"
+   "<head>\n"
+   "<title>Feeder [%s]</title>\n"
+   "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
+   "</head>\n"
+   "<body>\n"
+   "<h1>Feeder %s</h1>"
+   "Updated Schedule Conguration, %d items<BR>"
+   "<meta http-equiv='Refresh' content='3; url=/'>"
+   "</body>\n"
+   "</html>", conf.hostname, conf.hostname, webserver.args());
+   
+  webserver.send(200, "text/html", temp);
+  
+  saveSettings();
+  setAlarm(getNextAlarm());
+}
+
 /*
  * Convert a single hex digit character to its integer value
  */
