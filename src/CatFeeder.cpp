@@ -118,9 +118,9 @@ struct cfg {
 #define STATE_WEIGHTREPORT  0x02
 #define STATE_RTC_PRESENT   0x04
 #define STATE_RTC_INTR      0x08
-#define STATE_GOT_TIME      0x0F
-#define STATE_CHECK_HOPPER  0x10
-#define STATE_NO_SCHEDULE   0x20
+#define STATE_GOT_TIME      0x10
+#define STATE_CHECK_HOPPER  0x20
+#define STATE_NO_SCHEDULE   0x40
 
 volatile unsigned char  databits[MAX_BITS];    // stores all of the data bits
 volatile unsigned char  bitCount;              // number of bits currently captured
@@ -212,6 +212,7 @@ setup()
       magic = MAGIC;
       debug(true, "Resetting persistent records");
   }
+  state &= ~(STATE_GOT_TIME | STATE_RTC_PRESENT);
   if (rtc.begin()) {
     state |= STATE_RTC_PRESENT;
     rtc.disable32K();
@@ -239,7 +240,10 @@ setup()
   //RTC is in UTC
   DateTime alarm2(__DATE__, "00:00:00");
   rtc.setAlarm2(alarm2 - getTz(), DS3231_A2_Hour);
-  setAlarm(getNextAlarm());
+  if (state & STATE_GOT_TIME)
+    setAlarm(getNextAlarm());
+  else
+    state |= STATE_NO_SCHEDULE;
   pinMode(PIN_RTC_INTR, INPUT_PULLUP);
   attachInterrupt(PIN_RTC_INTR, ISR_RTC, FALLING);
 
@@ -354,6 +358,7 @@ loop()
     state &= ~STATE_RTC_INTR;
     if (rtc.alarmFired(1)) {
       uint8_t feedWeight;
+      debug(true, "RTC Alarm 1");
       rtc.clearAlarm(1);
       alarmIdx = getCurrentAlarm();
       if (conf.schedule[alarmIdx].weight)
@@ -371,6 +376,7 @@ loop()
       setAlarm(getNextAlarm()); 
     }
     if (rtc.alarmFired(2)) {
+      debug(true, "RTC Alarm 2");
       rtc.clearAlarm(2);
       dispensedTotal = 0;
       debug(true, "Reset dispensed total");
@@ -601,6 +607,9 @@ void
 ntpCallBack(struct timeval *tv)
 {
   DateTime  now(tv->tv_sec);
+  
+  if (~state & STATE_GOT_TIME)
+    setAlarm(getNextAlarm());
   
   state |= STATE_GOT_TIME;
 
