@@ -127,7 +127,7 @@ volatile unsigned char  bitCount;              // number of bits currently captu
 volatile unsigned char  flagDone;              // goes low when data is currently being captured
 volatile uint32_t       weigand_counter;       // countdown until we assume there are no more bits
 
-time_t        closeTime = 0, lastFeed = 0;
+time_t        closeTime = 0, lastFeed = 0, bootTime;
 RTC_NOINIT_ATTR uint8_t   state;
 RTC_NOINIT_ATTR float     dispensedTotal;
 RTC_NOINIT_ATTR time_t    lastDispense;
@@ -214,20 +214,23 @@ setup()
   }
   state &= ~(STATE_GOT_TIME | STATE_RTC_PRESENT);
   if (rtc.begin()) {
+    debug(false, "RTC present");
     state |= STATE_RTC_PRESENT;
     rtc.disable32K();
     rtc.writeSqwPinMode(DS3231_OFF);
     rtc.clearAlarm(1);
     rtc.clearAlarm(2);
     if (rtc.lostPower()) {
-      debug(false, "RTC lost power");
+      debug(false, "RTC lost power, time is invalid");
     }
     else {
+      debug(false, "Setting time from RTC");
       DateTime now = rtc.now();
       tv.tv_sec = now.unixtime();
       tv.tv_usec = 0;
       settimeofday(&tv, NULL);
       state |= STATE_GOT_TIME;
+      bootTime = now.unixtime();
     }
   }
   else {
@@ -608,8 +611,10 @@ ntpCallBack(struct timeval *tv)
 {
   DateTime  now(tv->tv_sec);
   
-  if (~state & STATE_GOT_TIME)
+  if (~state & STATE_GOT_TIME) {
     setAlarm(getNextAlarm());
+    bootTime = tv->tv_sec - millis() / 1000;
+  }
   
   state |= STATE_GOT_TIME;
 
@@ -766,18 +771,21 @@ debug(byte logtime, const char *format, ...)
 
 void
 wshandleRoot(void) {
-  char body[1920];
-  int sec = millis() / 1000;
+  char *body;
+  int sec = time(NULL) - bootTime;
   int min = sec / 60;
   int hr = min / 60;
   char alarm1Date[9] = "hh:mm:ss";
 
+  if ((body = (char *)malloc(1024)) == NULL) {
+    debug(true, "WEB / failed to allocate memory");
+    return;
+  }
   if (~state & STATE_NO_SCHEDULE) {
     DateTime alarm1 = rtc.getAlarm1() + getTz();
     alarm1.toString(alarm1Date);
   }
-
-  snprintf(body, 1920,
+  snprintf(body, 1024,
     "<html>"
     "<head>"
     "<meta http-equiv='refresh' content='20'/>"
@@ -797,7 +805,7 @@ wshandleRoot(void) {
         "<input name='Feed' type='submit' value='Feed'>\n"
       "</form>"
       "<p><font size=1>"
-      "Uptime: %02d:%02d:%02d<br>"
+      "Uptime: %d days %02d:%02d:%02d<br>"
       "Firmware: " __DATE__ " " __TIME__ "<br>"
       "Config Size: %d<br>"
       "offset: %ld<br>"
@@ -808,17 +816,19 @@ wshandleRoot(void) {
     state & STATE_CHECK_HOPPER ? "<p style='color: #AA0000;'>Check Hopper</p>" : "",
     ~state & STATE_NO_SCHEDULE ? alarm1Date : "No Schedule",
     weigh(true), dispensedTotal, conf.quota, conf.perFeed,
-    hr, min % 60, sec % 60,
+    sec / 86400, hr % 24, min % 60, sec % 60,
     sizeof(struct cfg), conf.offset, conf.scale
   );
   webserver.send(200, "text/html", body);
+  free(body);
 }
 
 void
 wshandleReboot()
 {
-  char body[400];
-  
+  char  *body;
+
+  body = (char *)malloc(400);
   snprintf(body, 400,
    "<html>\n"
    "<head>\n"
@@ -833,6 +843,7 @@ wshandleReboot()
    "</html>", conf.hostname, conf.hostname);
    
   webserver.send(200, "text/html", body);
+  free(body);
   delay(100);
   ESP.restart();
 }
@@ -848,7 +859,7 @@ wshandle404(void) {
   message += webserver.args();
   message += "\n";
 
-  for (uint8_t i = 0; i < webserver.args(); i++) {
+  for (uint8_t i = 0; i <= 254 & i < webserver.args(); i++) {
     message += " " + webserver.argName(i) + ": " + webserver.arg(i) + "\n";
   }
 
@@ -858,7 +869,14 @@ wshandle404(void) {
 void
 wshandleConfig(void)
 {
-  char  body[5520], temp[600];
+  char  *body, *temp;
+
+  if ((body = (char *)malloc(5520)) == NULL)
+    return;
+  if ((temp = (char *)malloc(600)) == NULL) {
+    free(body);
+    return;
+  }
   
   snprintf(body, 2000,
     "<html>\n"
@@ -875,16 +893,16 @@ wshandleConfig(void)
         "<label for='key'>WPA Key:</label><input name='key' type='text' value='%s' size='32' maxlength='63'><br>\n"
         "<label for='ntp'>NTP Server:</label><input name='ntp' type='text' value='%s' size='32' maxlength='63' "
           "pattern='^([a-z0-9]+)(\\.)([_a-z0-9]+)((\\.)([_a-z0-9]+))?$' title='A valid hostname'><br>\n"
-        "<label for=quota'>Daily quota:</label><input name='quota' type='number' value='%d' min='10' max='120'><br>\n"
-        "<label for=perfeed'>Per feed:</label><input name='perfeed' type='number' value='%d' min='1' max='25'><br>\n"
-        "<label for=cooloff'>Feed cooloff (minutes):</label><input name='cooloff' type='number' value='%d' min='0' max='120'><br><br>\n",
+        "<label for='quota'>Daily quota:</label><input name='quota' type='number' size='4' value='%d' min='10' max='120'><br>\n"
+        "<label for='perfeed'>Per feed:</label><input name='perfeed' type='number' size='4' value='%d' min='1' max='25'><br>\n"
+        "<label for='cooloff'>Feed cooloff (minutes):</label><input name='cooloff' type='number' size='4' value='%d' min='0' max='120'><br><br>\n",
         conf.hostname, conf.hostname, conf.hostname, conf.ssid, conf.wpakey, conf.ntpserver, conf.quota, conf.perFeed, conf.cooloff);
 
   for (int i = 0; i < CFG_NCATS; i++) {
     snprintf(temp, 600,
       "<label for='catname%d'>Cat %d:</label><input name='catname%d' type='text' value='%s' size='19' maxlength='19'><br>\n"
-      "<label for='facility%d'>Facility Code:</label><input name='facility%d' type='number' value='%d' min='0' max='255'><br>\n"
-      "<label for='id%d'>Tag ID:</label><input name='id%d' type='number' value='%d' min='0' max='8191'><br>\n"
+      "<label for='facility%d'>Facility Code:</label><input name='facility%d' type='number' size='4' value='%d' min='0' max='255'><br>\n"
+      "<label for='id%d'>Tag ID:</label><input name='id%d' type='number' size='4' value='%d' min='0' max='8191'><br>\n"
       "<label for='access%d'>Access:</label><input name='access%d' type='checkbox' value='true' %s><br>\n"
       "<label for='dispense%d'>Dispense:</label><input name='dispense%d' type='checkbox' value='true' %s><br><br>\n",
       i, i + 1, i, conf.cat[i].name, i, i, conf.cat[i].facility, i, i, conf.cat[i].id, i, i, conf.cat[i].flags & CFG_CAT_ACCESS ? "checked" : "",
@@ -903,14 +921,18 @@ wshandleConfig(void)
     "</body>\n"
     "</html>");
   webserver.send(200, "text/html", body);
+  free(body);
+  free(temp);
 }
 
 void
 wshandleSave(void)
 {
-  char  temp[400];
+  char  *temp;
   String value;
 
+  if ((temp = (char *)malloc(400)) == NULL)
+    return;
   if (webserver.hasArg("ssid")) {
     value = webserver.arg("ssid");
     strncpy(temp, value.c_str(), 399);
@@ -999,22 +1021,24 @@ wshandleSave(void)
    "</html>", conf.hostname, conf.hostname, webserver.args());
    
   webserver.send(200, "text/html", temp);
-  
+  free(temp);
   saveSettings();
 }
 
 void
 wshandleDoFeed()
 {
-  char  temp[400];
-  int   weight = 0;
-  String value;
+  char    *body;
+  int     weight = 0;
+  String  value;
 
+  if ((body = (char *)malloc(400)) == NULL)
+    return;
   value = webserver.arg("weight");
   if (value.length()&& value.toInt() > 0 && value.toInt() < 60)
     weight = value.toInt();
 
-  snprintf(temp, 400,
+  snprintf(body, 400,
    "<html>\n"
    "<head>\n"
    "<title>Feeder [%s]</title>\n"
@@ -1027,7 +1051,8 @@ wshandleDoFeed()
    "</body>\n"
    "</html>", conf.hostname, conf.hostname, weight);
    
-  webserver.send(200, "text/html", temp);
+  webserver.send(200, "text/html", body);
+  free(body);
   
   if (weight)
     dispensedTotal += dispense(weight);
@@ -1036,11 +1061,14 @@ wshandleDoFeed()
 void
 wshandleCalibrate(void)
 {
-  char  temp[512];
+  char  *body;
+
+  if ((body = (char *)malloc(512)) == NULL)
+    return;
 
   scale.set_scale();
   scale.tare(20);
-  snprintf(temp, 512,
+  snprintf(body, 512,
     "<html>\n"
     "<head>\n"
     "<title>Feeder [%s]</title>\n"
@@ -1056,15 +1084,19 @@ wshandleCalibrate(void)
     "</body>\n"
     "</html>", conf.hostname, conf.hostname);
    
-  webserver.send(200, "text/html", temp);
+  webserver.send(200, "text/html", body);
+  free(body);
 }
 
 void
 wshandleDoCalibrate(void)
 {
-  char  body[400];
-  String value;
-  
+  char    *body;
+  String  value;
+
+  if ((body = (char *)malloc(400)) == NULL)
+    return;
+
   value = webserver.arg("weight");
   if (value.length() && value.toInt() >= 1 && value.toInt() <= 2000) {
     scale.set_scale();
@@ -1073,7 +1105,7 @@ wshandleDoCalibrate(void)
     scale.set_offset(conf.offset);
     saveSettings();
   }
-  
+
   snprintf(body, 400,
    "<html>\n"
    "<head>\n"
@@ -1086,20 +1118,23 @@ wshandleDoCalibrate(void)
    "<meta http-equiv='Refresh' content='3; url=/'>"
    "</body>\n"
    "</html>", conf.hostname, conf.hostname, conf.scale);
-   
+
   webserver.send(200, "text/html", body);
+  free(body);
 }
 
 void
 wshandleTare(void)
 {
-  char  temp[400];
-  
+  char  *body;
+
+  if ((body = (char *)malloc(400)) == NULL)
+    return;
   scale.tare(100);
   conf.offset = scale.get_offset();
   saveSettings();
   
-  snprintf(temp, 400,
+  snprintf(body, 400,
    "<html>\n"
    "<head>\n"
    "<title>Feeder [%s]</title>\n"
@@ -1112,13 +1147,21 @@ wshandleTare(void)
    "</body>\n"
    "</html>", conf.hostname, conf.hostname, conf.offset);
    
-  webserver.send(200, "text/html", temp);
+  webserver.send(200, "text/html", body);
+  free(body);
 }
 
 void
 wshandleSchedule(void)
 {
-  char  body[5120], temp[600];
+  char  *body, *temp;
+
+  if ((body = (char *)malloc(5520)) == NULL)
+    return;
+  if ((temp = (char *)malloc(600)) == NULL) {
+    free(body);
+    return;
+  }
   
   snprintf(body, 2000,
     "<html>\n"
@@ -1153,13 +1196,18 @@ wshandleSchedule(void)
     "</html>");
 
   webserver.send(200, "text/html", body);
+  free(body);
+  free(temp);
 }
 
 void
 wshandleScheduleSave(void)
 {
-  char  temp[400];
+  char  *temp;
   String value;
+
+if ((temp = (char *)malloc(400)) == NULL)
+  return;
 
   for (int i=0; i < CFG_NSCHEDULES; i++) {
     snprintf(temp, 399, "t%d", i);
@@ -1206,7 +1254,8 @@ wshandleScheduleSave(void)
    "</html>", conf.hostname, conf.hostname, webserver.args());
    
   webserver.send(200, "text/html", temp);
-  
+  free(temp);
+
   saveSettings();
   setAlarm(getNextAlarm());
 }
