@@ -40,6 +40,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <stdarg.h>
+#include <esp_http_client.h>
 #include <EEPROM.h>      // EEPROM emulation is deprecated.
 #include <Preferences.h> // Convert settings to prefs at some point.
 
@@ -72,7 +73,33 @@ struct cfg {
     uint8_t weight;
     uint8_t flags;
   } schedule[CFG_NSCHEDULES];
+  struct {
+    uint8_t flags;
+    char    url[64];
+    char    topic[64];
+    char    username[16];
+    char    password[16];
+  } ntfy;
   uint16_t  crc;
+} __attribute__((__packed__));
+
+enum LOG_EVENT {LOG_DISPENSE, LOG_ACCESS, LOG_INTRUDER};
+struct log {
+  time_t          time;
+  enum LOG_EVENT  event;
+  union {
+    struct {
+      float weight;
+    } dispense;
+    struct {
+      uint8_t  facility;
+      uint16_t id;
+    } access;
+    struct {
+      uint8_t  facility;
+      uint16_t id;
+    } intruder;
+  } data;
 } __attribute__((__packed__));
 
 // Bitmap Configuration Flags
@@ -81,6 +108,8 @@ struct cfg {
 
 #define CFG_SCHED_ENABLE  0x01
 #define CFG_SCHED_SKIP    0x02
+
+#define CFG_NTFY_ENABLE   0x01
 
 #define SCALE_FACTOR 247.408408f
 #define SCALE_OFFSET 62236
@@ -121,6 +150,9 @@ struct cfg {
 #define STATE_GOT_TIME      0x10
 #define STATE_CHECK_HOPPER  0x20
 #define STATE_NO_SCHEDULE   0x40
+
+extern const char ca_pem_start[] asm("_binary_src_ca_pem_start");
+extern const char ca_pem_end[] asm("_binary_src_ca_pem_end");
 
 volatile unsigned char  databits[MAX_BITS];    // stores all of the data bits
 volatile unsigned char  bitCount;              // number of bits currently captured
@@ -167,6 +199,7 @@ uint8_t getNextAlarm(void);
 uint8_t getCurrentAlarm(void);
 void setAlarm(uint8_t);
 TimeSpan getTz(void);
+void ntfy(const char *, const char *, const uint8_t, const char *, ...);
 
 // interrupt that happens when INTO goes low (0 bit)
 void IRAM_ATTR ISR_D0(void)
@@ -311,6 +344,7 @@ setup()
 
     // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
     debug(true, "Updating: %s", type);
+    ntfy(WiFi.getHostname(), "floppy_disk", 3, "Updating: %s", type);
   })
   .onEnd([]() {
     debug(true, "Rebooting");
@@ -346,6 +380,7 @@ setup()
   attachInterrupt(PIN_DATA0, ISR_D0, FALLING);
   attachInterrupt(PIN_DATA1, ISR_D1, FALLING);
   weigand_counter = millis();
+  ntfy(WiFi.getHostname(), "facepalm", 3, "Boot up");
 }
 
 void
@@ -353,6 +388,7 @@ loop()
 {
   uint8_t   facilityCode = 0, alarmIdx;      // decoded facility code
   uint16_t  cardCode = 0;          // decoded card code
+  float	dispensed;
   
   ArduinoOTA.handle();
   webserver.handleClient();
@@ -374,8 +410,11 @@ loop()
       if (dispensedTotal + feedWeight > conf.quota)
         feedWeight = abs(conf.quota - dispensedTotal);
 
-      if (!(conf.schedule[alarmIdx].flags & CFG_SCHED_SKIP && weigh(true) > feedWeight / 2))
-        dispensedTotal += dispense(feedWeight);
+      if (!(conf.schedule[alarmIdx].flags & CFG_SCHED_SKIP && weigh(true) > feedWeight / 2)) {
+        dispensed = dispense(feedWeight);
+        dispensedTotal += dispensed;
+        ntfy(WiFi.getHostname(), "alarm_clock", 3, "Auto-dispensed %3.0fg of %dg, daily total %3.0fg of %dg", dispensed, feedWeight, dispensedTotal, conf.quota);
+      }
       setAlarm(getNextAlarm()); 
     }
     if (rtc.alarmFired(2)) {
@@ -396,8 +435,8 @@ loop()
   }
 
   weigh(false);
-  if (state & STATE_WEIGHTREPORT && time(NULL) - lastFeed > 30) {
-    debug(true, "Weight: %8.2fg", weigh(true));
+  if (state & STATE_WEIGHTREPORT && time(NULL) - lastFeed > 60) {
+    ntfy(WiFi.getHostname(), "balance_scale", 3, "Current weight: %3.0fg, daily total %3.0fg of %dg dispensed", weigh(true), dispensedTotal, conf.quota);
     state &= ~STATE_WEIGHTREPORT;
   }
 
@@ -458,19 +497,28 @@ checkCard(uint8_t facilityCode, uint16_t cardCode)
   if (i == CFG_NCATS) {
     debug(true, "Intruder: %s", catName(facilityCode, cardCode));
     closeDoor();
+    ntfy(WiFi.getHostname(), "no_entry", 3, "Intruder: facility %d, card %d", facilityCode, cardCode);
     return(0);
   }
   if (conf.cat[i].flags & CFG_CAT_ACCESS) {
-    lastFeed = time(NULL);
     state |= STATE_WEIGHTREPORT;
-    debug(true, "Authorized: %s", catName(facilityCode, cardCode));
     if (~state & STATE_OPEN)
       openDoor();
+    if (time(NULL) -lastFeed > 60) {
+      debug(true, "Authorized: %s", catName(facilityCode, cardCode));
+      ntfy(WiFi.getHostname(), "plate_with_cutlery", 3, "Authorized: %s", catName(facilityCode, cardCode));
+    }
+    lastFeed = time(NULL);
   }
-  else if (conf.cat[i].flags & CFG_CAT_DISPENSE)
-    dispensedTotal += dispense(conf.perFeed);
-  else
+  else if (conf.cat[i].flags & CFG_CAT_DISPENSE) {
+    dispensed = dispense(conf.perFeed);
+    dispensedTotal += dispensed;
+    ntfy(WiFi.getHostname(), "balance_scale", 3, "Manual-dispensed %3.0fg of %dg, daily total %3.0fg of %dg", dispensed, conf.perFeed, dispensedTotal, conf.quota);
+  }
+  else {
     closeDoor();
+    ntfy(WiFi.getHostname(), "no_entry", 3, "Intruder: %s", catName(facilityCode, cardCode));
+  }
   return (1);
 }
 
@@ -562,6 +610,8 @@ dispense(int grams)
   shutdownAuger();
   lastDispense = time(NULL);
   abs(grams - (curWeight - startWeight)) > 3 ? state |= STATE_CHECK_HOPPER : state &= ~STATE_CHECK_HOPPER;
+  if (state & STATE_CHECK_HOPPER)
+    ntfy(WiFi.getHostname(), "warning", 4, "Check Hopper");
   return(curWeight - startWeight);
 }
 
@@ -670,7 +720,7 @@ configInit(void)
   FastCRC16        CRC16;
   unsigned char   *p;
 
-  EEPROM.begin(512);
+  EEPROM.begin(1024);
   p = (unsigned char *)&conf;
   for (uint16_t i = 0; i < sizeof(struct cfg); i++)
     *p++ = EEPROM.read(i);
@@ -755,7 +805,7 @@ debug(byte logtime, const char *format, ...)
   struct tm *tm = localtime(&t);
   
   va_start(pvar, format);
-  if (logtime && state | STATE_GOT_TIME) {
+  if (logtime && state & STATE_GOT_TIME) {
     strftime(timestr, 20, "%F %T", tm);
     Serial.print(timestr);
     Serial.print(": "); 
@@ -763,6 +813,82 @@ debug(byte logtime, const char *format, ...)
   vsnprintf(str, 60, format, pvar);
   Serial.println(str);
   va_end(pvar);
+}
+
+// tags: https://docs.ntfy.sh/emojis/
+// priority: https://docs.ntfy.sh/publish/#message-priority
+void
+ntfy(const char *title, const char *tags, const uint8_t priority, const char *format, ...)
+{
+  esp_err_t err;
+  va_list   pvar;
+  char     *buffer, *message;
+  int content_length, wlen;
+
+  if (~conf.ntfy.flags & CFG_NTFY_ENABLE)
+    return;
+
+  if ((buffer = (char *)malloc(3072)) == NULL) {
+    debug(true, "NTFY failed to allocate memory");
+    return;
+  }
+  if ((message = (char *)malloc(2048)) == NULL) {
+    debug(true, "NTFY failed to allocate memory");
+    free(buffer);
+    return;
+  }
+  va_start(pvar, format);
+  vsnprintf(message, 2048, format, pvar);
+  va_end(pvar);
+
+  esp_http_client_config_t config = {
+    .url = conf.ntfy.url,
+    .username = conf.ntfy.username,
+    .password = conf.ntfy.password,
+    .auth_type = HTTP_AUTH_TYPE_BASIC,
+    .cert_pem = ca_pem_start
+  };
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  esp_http_client_set_method(client, HTTP_METHOD_POST);
+  esp_http_client_set_header(client, "Content-Type", "application/json");
+
+  const char *post_data = "{"
+      "\"topic\":\"%s\","
+      "\"title\":\"%s\","
+      "\"tags\":[\"%s\"],"
+      "\"priority\":%d,"
+      "\"message\":\"%s\""
+    "}";
+  content_length = snprintf(buffer, 3072, post_data, conf.ntfy.topic, title, tags, priority, message);
+  err = esp_http_client_open(client, content_length);
+  if (err != ESP_OK) {
+    debug(true, "NTFY connection failed: %s", esp_err_to_name(err));
+    esp_http_client_cleanup(client);
+    free(message);
+    free(buffer);
+    return;
+  } 
+  wlen = esp_http_client_write(client, buffer, content_length);
+  if (wlen < 0) {
+    debug(true, "Write failed");
+  }
+  content_length = esp_http_client_fetch_headers(client);
+  if (content_length < 0) {
+    debug(true, "HTTP client fetch headers failed");
+  } else {
+    int data_read = esp_http_client_read_response(client, buffer, 2048);
+    if (data_read >= 0) {
+      debug(true, "HTTP POST Status = %d, content_length = %ld",
+        esp_http_client_get_status_code(client),
+        esp_http_client_get_content_length(client));
+      debug(true, buffer, strlen(buffer));
+    } else {
+      debug(true, "Failed to read response");
+    }
+  }
+  free(message);
+  free(buffer);
+  esp_http_client_cleanup(client);
 }
 
 /*
@@ -871,14 +997,16 @@ wshandleConfig(void)
 {
   char  *body, *temp;
 
-  if ((body = (char *)malloc(5520)) == NULL)
+  // 6298 characters max body size.
+  if ((body = (char *)malloc(6300)) == NULL)
     return;
   if ((temp = (char *)malloc(600)) == NULL) {
     free(body);
     return;
   }
   
-  snprintf(body, 2000,
+  // max 2084 characters.
+  snprintf(body, 2100,
     "<html>\n"
     "<head>\n"
     "<title>Feeder [%s]</title>\n"
@@ -895,9 +1023,17 @@ wshandleConfig(void)
           "pattern='^([a-z0-9]+)(\\.)([_a-z0-9]+)((\\.)([_a-z0-9]+))?$' title='A valid hostname'><br>\n"
         "<label for='quota'>Daily quota:</label><input name='quota' type='number' size='4' value='%d' min='10' max='120'><br>\n"
         "<label for='perfeed'>Per feed:</label><input name='perfeed' type='number' size='4' value='%d' min='1' max='25'><br>\n"
-        "<label for='cooloff'>Feed cooloff (minutes):</label><input name='cooloff' type='number' size='4' value='%d' min='0' max='120'><br><br>\n",
-        conf.hostname, conf.hostname, conf.hostname, conf.ssid, conf.wpakey, conf.ntpserver, conf.quota, conf.perFeed, conf.cooloff);
+        "<label for='cooloff'>Feed cooloff (minutes):</label><input name='cooloff' type='number' size='4' value='%d' min='0' max='120'><br><br>\n"
+        "<label for='ntfy'>Notifications:</label><input name='ntfy' type='checkbox' value='true' %s><br>\n"
+        "<label for='url'>Service URL:</label><input name='url' type='text' value='%s' size='63' maxlength='63'><br>\n"
+        "<label for='topic'>Topic:</label><input name='topic' type='text' value='%s' size='32' maxlength='63'><br>\n"
+        "<label for='user'>Username:</label><input name='user' type='text' value='%s' size='15' maxlength='15'><br>\n"
+        "<label for='passwd'>Password:</label><input name='passwd' type='text' value='%s' size='15' maxlength='15'><br>\n"
+        "<br>\n",
+        conf.hostname, conf.hostname, conf.hostname, conf.ssid, conf.wpakey, conf.ntpserver, conf.quota, conf.perFeed, conf.cooloff,
+        conf.ntfy.flags & CFG_NTFY_ENABLE ? "checked" : "", conf.ntfy.url, conf.ntfy.topic, conf.ntfy.username, conf.ntfy.password);
 
+  // max 576 characters per cat
   for (int i = 0; i < CFG_NCATS; i++) {
     snprintf(temp, 600,
       "<label for='catname%d'>Cat %d:</label><input name='catname%d' type='text' value='%s' size='19' maxlength='19'><br>\n"
@@ -910,7 +1046,7 @@ wshandleConfig(void)
     );
     strcat(body, temp);
   }
-
+  // 185 characters
   strcat(body,
     "<input name='Save' type='submit' value='Save'>\n"
     "</form>"
@@ -972,6 +1108,39 @@ wshandleSave(void)
   value = webserver.arg("cooloff");
   if (value.length() && value.toInt() >= 0 && value.toInt() <= 120)
     conf.cooloff = value.toInt();
+
+  if (webserver.hasArg("ntfy"))
+    conf.ntfy.flags |= CFG_NTFY_ENABLE;
+  else
+    conf.ntfy.flags &= ~CFG_NTFY_ENABLE;
+
+  if (webserver.hasArg("url")) {
+    value = webserver.arg("url");
+    strncpy(temp, value.c_str(), 399);
+    urlDecode(temp);
+    strncpy(conf.ntfy.url, temp, 64);
+  }
+
+  if (webserver.hasArg("topic")) {
+    value = webserver.arg("topic");
+    strncpy(temp, value.c_str(), 399);
+    urlDecode(temp);
+    strncpy(conf.ntfy.topic, temp, 64);
+  }
+
+  if (webserver.hasArg("user")) {
+    value = webserver.arg("user");
+    strncpy(temp, value.c_str(), 399);
+    urlDecode(temp);
+    strncpy(conf.ntfy.username, temp, 16);
+  }
+
+  if (webserver.hasArg("passwd")) {
+    value = webserver.arg("passwd");
+    strncpy(temp, value.c_str(), 399);
+    urlDecode(temp);
+    strncpy(conf.ntfy.password, temp, 16);
+  }
 
   for (int i=0; i < CFG_NCATS; i++) {
     snprintf(temp, 399, "catname%d", i);
@@ -1054,8 +1223,11 @@ wshandleDoFeed()
   webserver.send(200, "text/html", body);
   free(body);
   
-  if (weight)
-    dispensedTotal += dispense(weight);
+  if (weight) {
+    float dispensed = dispense(weight);
+    dispensedTotal += dispensed;
+    ntfy(WiFi.getHostname(), "desktop_computer", 3, "Web-dispensed %3.0fg of %dg, daily total %3.0fg of %dg", dispensed, weight, dispensedTotal, conf.quota);
+  }
 }
 
 void

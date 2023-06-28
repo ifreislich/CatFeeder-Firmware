@@ -3,3 +3,4 @@
 lib/AccelStepper/
 lib/FastCRC/
 lib/HX711/
+src/ca.pem
