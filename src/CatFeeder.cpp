@@ -30,13 +30,13 @@
 #include <WiFiClient.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
-#include <ESPmDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <FastCRC.h>
 #include <HX711.h>
 #include <esp_sntp.h>
 #include <RTClib.h>
+#include <SNMP_Agent.h>
 #include <time.h>
 #include <sys/time.h>
 #include <stdarg.h>
@@ -55,7 +55,7 @@ struct cfg {
   char      hostname[33];
   char      ssid[64];
   char      wpakey[64];
-  uint8_t   logServer[4];
+  uint32_t  flags;
   char      ntpserver[64];
   struct {
      char     name[20];
@@ -74,12 +74,14 @@ struct cfg {
     uint8_t flags;
   } schedule[CFG_NSCHEDULES];
   struct {
-    uint8_t flags;
+    uint8_t pad;
     char    url[64];
     char    topic[64];
     char    username[16];
     char    password[16];
   } ntfy;
+  char      snmpro[64];
+  char      snmprw[64];
   uint16_t  crc;
 } __attribute__((__packed__));
 
@@ -103,13 +105,16 @@ struct log {
 } __attribute__((__packed__));
 
 // Bitmap Configuration Flags
+#define CFG_NTFY_ENABLE     0x01
+#define CFG_DISPENSE_CLOSED 0x02
+#define CFG_ENGINEERING     0x04
+#define CFG_SNMP_ENABLE     0x08
+
 #define CFG_CAT_ACCESS    0x01
 #define CFG_CAT_DISPENSE  0x02
 
 #define CFG_SCHED_ENABLE  0x01
 #define CFG_SCHED_SKIP    0x02
-
-#define CFG_NTFY_ENABLE   0x01
 
 #define SCALE_FACTOR 247.408408f
 #define SCALE_OFFSET 62236
@@ -136,35 +141,35 @@ struct log {
 
 #define PIN_DATA0       27
 #define PIN_DATA1       26
-#define MAX_BITS        100            // max number of bits 
 #define WEIGAND_TIMEOUT 20     // timeout in ms on Wiegand sequence 
 #define DOOR_TIMEOUT    60        // Door stays unlocked for max X seconds
 
 #define PIN_RTC_INTR    19
 
 // Bitmap States
-#define STATE_OPEN          0x01
-#define STATE_WEIGHTREPORT  0x02
-#define STATE_RTC_PRESENT   0x04
-#define STATE_RTC_INTR      0x08
-#define STATE_GOT_TIME      0x10
-#define STATE_CHECK_HOPPER  0x20
-#define STATE_NO_SCHEDULE   0x40
+#define STATE_OPEN          0x0001
+#define STATE_WEIGHTREPORT  0x0002
+#define STATE_RTC_PRESENT   0x0004
+#define STATE_RTC_INTR      0x0008
+#define STATE_GOT_TIME      0x0010
+#define STATE_CHECK_HOPPER  0x0020
+#define STATE_NO_SCHEDULE   0x0040
+#define STATE_SKIP_DISPENSE 0x0080
+#define STATE_WEIGAND_DONE  0x0100
 
 extern const char ca_pem_start[] asm("_binary_src_ca_pem_start");
 extern const char ca_pem_end[] asm("_binary_src_ca_pem_end");
 
-volatile unsigned char  databits[MAX_BITS];    // stores all of the data bits
+volatile uint64_t       databits;              // stores all of the data bits
 volatile unsigned char  bitCount;              // number of bits currently captured
-volatile unsigned char  flagDone;              // goes low when data is currently being captured
-volatile uint32_t       weigand_counter;       // countdown until we assume there are no more bits
 
-time_t        closeTime = 0, lastFeed = 0, bootTime;
-RTC_NOINIT_ATTR uint8_t   state;
+time_t        closeTime = 0, lastAuth = 0, bootTime;
+RTC_NOINIT_ATTR volatile uint16_t  state;
 RTC_NOINIT_ATTR float     dispensedTotal;
 RTC_NOINIT_ATTR time_t    lastDispense;
 RTC_NOINIT_ATTR uint32_t  magic;
 struct cfg    conf;
+hw_timer_t   *timer;
 
 void wshandleRoot(void);
 void wshandleConfig(void);
@@ -177,10 +182,13 @@ void wshandleDoCalibrate(void);
 void wshandleTare(void);
 void wshandleSchedule(void);
 void wshandleScheduleSave(void);
+void wshandleSeed(void);
+void wshandleDoSeed(void);
 
 int checkCard(uint8_t, uint16_t);
 const char *catName(uint8_t, uint16_t);
 float weigh(bool);
+int snmpGetWeight(void);
 void debug(byte, const char *, ...);
 void ntpCallBack(struct timeval *);
 void wifiEvent(WiFiEvent_t);
@@ -201,23 +209,41 @@ void setAlarm(uint8_t);
 TimeSpan getTz(void);
 void ntfy(const char *, const char *, const uint8_t, const char *, ...);
 
-// interrupt that happens when INTO goes low (0 bit)
-void IRAM_ATTR ISR_D0(void)
+void IRAM_ATTR
+ISR_weigandTimer0(void)
 {
-  bitCount++;
-  flagDone = 0;
-  weigand_counter = millis() + WEIGAND_TIMEOUT;
+  state |= STATE_WEIGAND_DONE;
+}
+
+// interrupt that happens when INTO goes low (0 bit)
+void IRAM_ATTR
+ISR_D0(void)
+{
+  if (~state & STATE_WEIGAND_DONE) {
+    timerRestart(timer);
+    if (!timerAlarmEnabled(timer))
+      timerAlarmEnable(timer);
+    bitCount++;
+    databits <<= 1;
+  }
 }
 
 // interrupt that happens when INT1 goes low (1 bit)
-void IRAM_ATTR ISR_D1(void)
+void IRAM_ATTR
+ISR_D1(void)
 {
-  databits[bitCount++] = 1;
-  flagDone = 0;
-  weigand_counter = millis() + WEIGAND_TIMEOUT;
+  if (~state & STATE_WEIGAND_DONE) {
+    timerRestart(timer);
+    if (!timerAlarmEnabled(timer))
+      timerAlarmEnable(timer);
+    bitCount++;
+    databits <<= 1;
+    databits |= 1;
+  }
 }
 
-void IRAM_ATTR ISR_RTC(void)
+void IRAM_ATTR
+ISR_RTC(void)
 {
   state |= STATE_RTC_INTR;
 }
@@ -225,9 +251,11 @@ void IRAM_ATTR ISR_RTC(void)
 #define PIN_HX711_CLK   32
 #define PIN_HX711_DATA  34  // This is an input only pin without pullup.
 #define PIN_HX711_RATE  33
-HX711     scale;
-WebServer webserver(80);
-RTC_DS3231 rtc;
+HX711       scale;
+WebServer   webserver(80);
+RTC_DS3231  rtc;
+WiFiUDP     udp;
+SNMPAgent   snmp;
 
 void
 setup()
@@ -246,6 +274,7 @@ setup()
       debug(true, "Resetting persistent records");
   }
   state &= ~(STATE_GOT_TIME | STATE_RTC_PRESENT);
+  state &= ~STATE_WEIGAND_DONE;
   if (rtc.begin()) {
     debug(false, "RTC present");
     state |= STATE_RTC_PRESENT;
@@ -278,8 +307,10 @@ setup()
   rtc.setAlarm2(alarm2 - getTz(), DS3231_A2_Hour);
   if (state & STATE_GOT_TIME)
     setAlarm(getNextAlarm());
-  else
+  else {
     state |= STATE_NO_SCHEDULE;
+    rtc.disableAlarm(1);
+  }
   pinMode(PIN_RTC_INTR, INPUT_PULLUP);
   attachInterrupt(PIN_RTC_INTR, ISR_RTC, FALLING);
 
@@ -333,6 +364,15 @@ setup()
   scale.set_offset(conf.offset);
   state &= ~STATE_WEIGHTREPORT;
 
+  snmp = SNMPAgent(conf.snmpro, conf.snmprw);
+  snmp.setUDP(&udp);
+  snmp.begin();
+  snmp.addDynamicIntegerHandler(".1.3.6.1.4.1.5.0", snmpGetWeight);
+
+  timer = timerBegin(0, 80, true);
+  timerAttachInterrupt(timer, &ISR_weigandTimer0, true);
+  timerAlarmWrite(timer, WEIGAND_TIMEOUT * 1000, false);
+
   ArduinoOTA.setHostname(hostname);
   ArduinoOTA
   .onStart([]() {
@@ -372,6 +412,8 @@ setup()
   webserver.on("/tare", wshandleTare);
   webserver.on("/schedule", wshandleSchedule);
   webserver.on("/schedulesave", wshandleScheduleSave);
+  webserver.on("/seed", wshandleSeed);
+  webserver.on("/doseed", wshandleDoSeed);
   webserver.onNotFound(wshandle404);
   webserver.begin();
   ArduinoOTA.begin();
@@ -379,7 +421,6 @@ setup()
   openDoor();
   attachInterrupt(PIN_DATA0, ISR_D0, FALLING);
   attachInterrupt(PIN_DATA1, ISR_D1, FALLING);
-  weigand_counter = millis();
   ntfy(WiFi.getHostname(), "facepalm", 3, "Boot up");
 }
 
@@ -392,6 +433,8 @@ loop()
   
   ArduinoOTA.handle();
   webserver.handleClient();
+  if (conf.flags & CFG_SNMP_ENABLE)
+    snmp.loop();
 
   if (state & STATE_RTC_INTR) {
     state &= ~STATE_RTC_INTR;
@@ -410,10 +453,13 @@ loop()
       if (dispensedTotal + feedWeight > conf.quota)
         feedWeight = abs(conf.quota - dispensedTotal);
 
-      if (!(conf.schedule[alarmIdx].flags & CFG_SCHED_SKIP && weigh(true) > feedWeight / 2)) {
+      if (!(conf.schedule[alarmIdx].flags & CFG_SCHED_SKIP && (weigh(true) > feedWeight / 2 || state & STATE_SKIP_DISPENSE))) {
         dispensed = dispense(feedWeight);
         dispensedTotal += dispensed;
-        ntfy(WiFi.getHostname(), "alarm_clock", 3, "Auto-dispensed %3.0fg of %dg, daily total %3.0fg of %dg", dispensed, feedWeight, dispensedTotal, conf.quota);
+        alarmIdx = getNextAlarm();
+        state |= STATE_SKIP_DISPENSE;
+        ntfy(WiFi.getHostname(), "alarm_clock", 3, "Auto-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg\\nNext dispense: %02d:%02d",
+          dispensed, feedWeight, dispensedTotal, conf.quota, conf.schedule[alarmIdx].hour, conf.schedule[alarmIdx].minute);
       }
       setAlarm(getNextAlarm()); 
     }
@@ -435,52 +481,36 @@ loop()
   }
 
   weigh(false);
-  if (state & STATE_WEIGHTREPORT && time(NULL) - lastFeed > 60) {
-    ntfy(WiFi.getHostname(), "balance_scale", 3, "Current weight: %3.0fg, daily total %3.0fg of %dg dispensed", weigh(true), dispensedTotal, conf.quota);
+  if (state & STATE_WEIGHTREPORT && time(NULL) - lastAuth > 120) {
+    ntfy(WiFi.getHostname(), "balance_scale", 3, "End weight: %3.0fg\\nDispensed total: %3.0fg of %dg", weigh(true), dispensedTotal, conf.quota);
     state &= ~STATE_WEIGHTREPORT;
   }
 
-  // This waits to make sure that there have been no more data pulses before processing data
-  if (!flagDone && weigand_counter < millis())
-    flagDone = 1;
-  // if we have bits and we the weigand counter went out
-  if (bitCount > 0 && flagDone) {
-    unsigned char i;
-
+  // if we have bits and we the weigand transmission timed out
+  if (bitCount > 0 && state & STATE_WEIGAND_DONE) {
     switch (bitCount) {
-      case 35: // 35 bit HID Corporate 1000 format
-        // facility code = bits 2 to 14 (4096)
-        // card code = bits 15 to 34 (524288)
-        // For now, we don't support 35 bit Wiegand.
-        break;
       case 26: // standard 26 bit format
-        // facility code = bits 2 to 9 (128)
-        for (i = 1; i < 9; i++) {
-          facilityCode <<= 1;
-          facilityCode |= databits[i];
-        }
-
-        // card code = bits 10 to 23 (4096)
-        for (i = 9; i < 25; i++) {
-          cardCode <<= 1;
-          cardCode |= databits[i];
-        }
-        if (facilityCode && cardCode)
-          checkCard(facilityCode, cardCode);
+        // Even parity over bits 2-13 = bit 1
+        // facility code = bits 2 to 9 (256) mask = 0b01111111100000000000000000
+        // card code = bits 10 to 25 (65535) mask = 0b11111111111111110
+        // Odd parity over bits 14-25 = bit 26
+        facilityCode = (databits & 0x1FE0000) >> 17;
+        cardCode = (databits & 0x1FFFE) >> 1;
         break;
       default:
         break;
         // you can add other formats if you want!
         // Serial.println("Unable to decode.");
     }
+    if (facilityCode && cardCode)
+      checkCard(facilityCode, cardCode);
+  }
 
-    // cleanup and get ready for the next card
+  // cleanup and get ready for the next card
+  if (state & STATE_WEIGAND_DONE) {
     bitCount = 0;
-    facilityCode = 0;
-    cardCode = 0;
-    for (i = 0; i < MAX_BITS; i++) {
-      databits[i] = 0;
-    }
+    databits = 0;
+    state &= ~STATE_WEIGAND_DONE;
   }
 }
 
@@ -502,18 +532,20 @@ checkCard(uint8_t facilityCode, uint16_t cardCode)
   }
   if (conf.cat[i].flags & CFG_CAT_ACCESS) {
     state |= STATE_WEIGHTREPORT;
+    state &= ~STATE_SKIP_DISPENSE;
     if (~state & STATE_OPEN)
       openDoor();
-    if (time(NULL) -lastFeed > 60) {
+    if (time(NULL) - lastAuth > 120) {
       debug(true, "Authorized: %s", catName(facilityCode, cardCode));
-      ntfy(WiFi.getHostname(), "plate_with_cutlery", 3, "Authorized: %s", catName(facilityCode, cardCode));
+      ntfy(WiFi.getHostname(), "plate_with_cutlery", 3, "Authorized: %s\\nStart weight: %3.0fg", catName(facilityCode, cardCode), weigh(true));
     }
-    lastFeed = time(NULL);
+    lastAuth = time(NULL);
   }
   else if (conf.cat[i].flags & CFG_CAT_DISPENSE) {
     dispensed = dispense(conf.perFeed);
     dispensedTotal += dispensed;
-    ntfy(WiFi.getHostname(), "balance_scale", 3, "Manual-dispensed %3.0fg of %dg, daily total %3.0fg of %dg", dispensed, conf.perFeed, dispensedTotal, conf.quota);
+    state |= STATE_SKIP_DISPENSE;
+    ntfy(WiFi.getHostname(), "cook", 3, "Manual-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg", dispensed, conf.perFeed, dispensedTotal, conf.quota);
   }
   else {
     closeDoor();
@@ -577,10 +609,13 @@ dispense(int grams)
 {
   float           startWeight = weigh(false), curWeight;
 
+  // Override cooloff period if the last dispense didn't fully succeed.
   if (~state & STATE_CHECK_HOPPER && (time(NULL) < lastDispense + conf.cooloff * 60 || dispensedTotal >= conf.quota))
     return(0);
 
   debug(true, "Dispense %dg", grams);
+  if (conf.flags & CFG_DISPENSE_CLOSED)
+    closeDoor();
   enableAuger();
   // This is a bit of a magic number. 5 revolutions with a reversal
   // of 0.25 revolution every revolutions dispenses about 10 grams
@@ -595,7 +630,7 @@ dispense(int grams)
       // Weigh every 45 degrees rotation
       if (i % 400 == 0) {
         curWeight = weigh(false);
-        if (curWeight - startWeight > grams)
+        if (curWeight - startWeight >= grams)
           stop = 1;
         webserver.handleClient();
       }
@@ -608,10 +643,13 @@ dispense(int grams)
     }
   }
   shutdownAuger();
+  if (conf.flags & CFG_DISPENSE_CLOSED)
+    openDoor();
   lastDispense = time(NULL);
-  abs(grams - (curWeight - startWeight)) > 3 ? state |= STATE_CHECK_HOPPER : state &= ~STATE_CHECK_HOPPER;
+  grams - (curWeight - startWeight) > 3 ? state |= STATE_CHECK_HOPPER : state &= ~STATE_CHECK_HOPPER;
   if (state & STATE_CHECK_HOPPER)
     ntfy(WiFi.getHostname(), "warning", 4, "Check Hopper");
+  state |= STATE_SKIP_DISPENSE;
   return(curWeight - startWeight);
 }
 
@@ -654,6 +692,12 @@ weigh(bool doAverage)
   for (int i = 0; i < 100; i++)
       total += weight[i];
   return(total / 100);
+}
+
+int
+snmpGetWeight(void)
+{
+  return(weigh(true) * 1000);
 }
 
 void
@@ -711,6 +755,8 @@ defaultSettings(void)
   // Do not clear calibration data 
   memset(&conf.hostname, '\0', sizeof(struct cfg) - (offsetof(struct cfg, hostname) - offsetof(struct cfg, magic)));
   WiFi.macAddress().toCharArray(conf.hostname, 32);
+  strcpy(conf.snmpro, "public");
+  strcpy(conf.snmprw, "private");
   conf.magic = MAGIC;
 }
 
@@ -775,6 +821,7 @@ setAlarm(uint8_t alarm)
 {
   if (alarm >= CFG_NSCHEDULES) {
     state |= STATE_NO_SCHEDULE;
+    rtc.disableAlarm(1);
     return;
   }
   state &= ~STATE_NO_SCHEDULE;
@@ -825,7 +872,7 @@ ntfy(const char *title, const char *tags, const uint8_t priority, const char *fo
   char     *buffer, *message;
   int content_length, wlen;
 
-  if (~conf.ntfy.flags & CFG_NTFY_ENABLE)
+  if (~conf.flags & CFG_NTFY_ENABLE)
     return;
 
   if ((buffer = (char *)malloc(3072)) == NULL) {
@@ -901,7 +948,7 @@ wshandleRoot(void) {
   int sec = time(NULL) - bootTime;
   int min = sec / 60;
   int hr = min / 60;
-  char alarm1Date[9] = "hh:mm:ss";
+  char alarm1Date[9] = "hh:mm";
 
   if ((body = (char *)malloc(1024)) == NULL) {
     debug(true, "WEB / failed to allocate memory");
@@ -997,16 +1044,16 @@ wshandleConfig(void)
 {
   char  *body, *temp;
 
-  // 6298 characters max body size.
-  if ((body = (char *)malloc(6300)) == NULL)
+  // 6844 characters max body size.
+  if ((body = (char *)malloc(6850)) == NULL)
     return;
   if ((temp = (char *)malloc(600)) == NULL) {
     free(body);
     return;
   }
   
-  // max 2084 characters.
-  snprintf(body, 2100,
+  // max 2182 characters.
+  snprintf(body, 2648,
     "<html>\n"
     "<head>\n"
     "<title>Feeder [%s]</title>\n"
@@ -1023,15 +1070,21 @@ wshandleConfig(void)
           "pattern='^([a-z0-9]+)(\\.)([_a-z0-9]+)((\\.)([_a-z0-9]+))?$' title='A valid hostname'><br>\n"
         "<label for='quota'>Daily quota:</label><input name='quota' type='number' size='4' value='%d' min='10' max='120'><br>\n"
         "<label for='perfeed'>Per feed:</label><input name='perfeed' type='number' size='4' value='%d' min='1' max='25'><br>\n"
+        "<label for='ctf'>Close to feed:</label><input name='ctf' type='checkbox' value='true' %s><br>\n"
         "<label for='cooloff'>Feed cooloff (minutes):</label><input name='cooloff' type='number' size='4' value='%d' min='0' max='120'><br><br>\n"
         "<label for='ntfy'>Notifications:</label><input name='ntfy' type='checkbox' value='true' %s><br>\n"
-        "<label for='url'>Service URL:</label><input name='url' type='text' value='%s' size='63' maxlength='63'><br>\n"
+        "<label for='url'>Service URL:</label><input name='url' type='text' value='%s' size='32' maxlength='63'><br>\n"
         "<label for='topic'>Topic:</label><input name='topic' type='text' value='%s' size='32' maxlength='63'><br>\n"
         "<label for='user'>Username:</label><input name='user' type='text' value='%s' size='15' maxlength='15'><br>\n"
-        "<label for='passwd'>Password:</label><input name='passwd' type='text' value='%s' size='15' maxlength='15'><br>\n"
+        "<label for='passwd'>Password:</label><input name='passwd' type='text' value='%s' size='15' maxlength='15'><br><br>\n"
+        "<label for='snmp'>SNMP:</label><input name='snmp' type='checkbox' value='true' %s><br>\n"
+        "<label for='snmpro'>RO Community:</label><input name='snmpro' type='text' value='%s' size='32' maxlength='63'><br>\n"
+        "<label for='snmprw'>RW Community:</label><input name='snmprw' type='text' value='%s' size='32' maxlength='63'><br>\n"
         "<br>\n",
-        conf.hostname, conf.hostname, conf.hostname, conf.ssid, conf.wpakey, conf.ntpserver, conf.quota, conf.perFeed, conf.cooloff,
-        conf.ntfy.flags & CFG_NTFY_ENABLE ? "checked" : "", conf.ntfy.url, conf.ntfy.topic, conf.ntfy.username, conf.ntfy.password);
+        conf.hostname, conf.hostname, conf.hostname, conf.ssid, conf.wpakey, conf.ntpserver, conf.quota, conf.perFeed,
+        conf.flags & CFG_DISPENSE_CLOSED ? "checked" : "", conf.cooloff,
+        conf.flags & CFG_NTFY_ENABLE ? "checked" : "", conf.ntfy.url, conf.ntfy.topic, conf.ntfy.username, conf.ntfy.password,
+        conf.flags & CFG_SNMP_ENABLE ? "checked" : "", conf.snmpro, conf.snmprw);
 
   // max 576 characters per cat
   for (int i = 0; i < CFG_NCATS; i++) {
@@ -1105,14 +1158,19 @@ wshandleSave(void)
   if (value.length() && value.toInt() >= 1 && value.toInt() <= 25)
     conf.perFeed = value.toInt();
 
+  if (webserver.hasArg("ctf"))
+    conf.flags |= CFG_DISPENSE_CLOSED;
+  else
+    conf.flags &= ~CFG_DISPENSE_CLOSED;
+
   value = webserver.arg("cooloff");
   if (value.length() && value.toInt() >= 0 && value.toInt() <= 120)
     conf.cooloff = value.toInt();
 
   if (webserver.hasArg("ntfy"))
-    conf.ntfy.flags |= CFG_NTFY_ENABLE;
+    conf.flags |= CFG_NTFY_ENABLE;
   else
-    conf.ntfy.flags &= ~CFG_NTFY_ENABLE;
+    conf.flags &= ~CFG_NTFY_ENABLE;
 
   if (webserver.hasArg("url")) {
     value = webserver.arg("url");
@@ -1140,6 +1198,27 @@ wshandleSave(void)
     strncpy(temp, value.c_str(), 399);
     urlDecode(temp);
     strncpy(conf.ntfy.password, temp, 16);
+  }
+
+  if (webserver.hasArg("snmp"))
+    conf.flags |= CFG_SNMP_ENABLE;
+  else
+    conf.flags &= ~CFG_SNMP_ENABLE;
+
+  if (webserver.hasArg("snmpro")) {
+    value = webserver.arg("snmpro");
+    strncpy(temp, value.c_str(), 399);
+    urlDecode(temp);
+    strncpy(conf.snmpro, temp, 64);
+    snmp.setReadOnlyCommunity(conf.snmpro);
+  }
+
+  if (webserver.hasArg("snmprw")) {
+    value = webserver.arg("snmprw");
+    strncpy(temp, value.c_str(), 399);
+    urlDecode(temp);
+    strncpy(conf.snmprw, temp, 64);
+    snmp.setReadWriteCommunity(conf.snmprw);
   }
 
   for (int i=0; i < CFG_NCATS; i++) {
@@ -1226,7 +1305,7 @@ wshandleDoFeed()
   if (weight) {
     float dispensed = dispense(weight);
     dispensedTotal += dispensed;
-    ntfy(WiFi.getHostname(), "desktop_computer", 3, "Web-dispensed %3.0fg of %dg, daily total %3.0fg of %dg", dispensed, weight, dispensedTotal, conf.quota);
+    ntfy(WiFi.getHostname(), "desktop_computer", 3, "Web-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg", dispensed, weight, dispensedTotal, conf.quota);
   }
 }
 
@@ -1249,7 +1328,7 @@ wshandleCalibrate(void)
     "<body>\n"
     "<h1>Feeder %s</h1>"
     "Place a known weight on the empty bowl and enter the weight weight below<br><br>"
-    "<form method='post' action='/docalibrate' name='Configuration'/>\n"
+    "<form method='post' action='/docalibrate' name='Calibrate'/>\n"
       "<label for=weight'>Weight:</label><input name='weight' type='number' value='100' min='100' max='2000'><br><br>\n"
     "<input name='Save' type='submit' value='Calibrate'>\n"
     "</form>"
@@ -1430,6 +1509,65 @@ if ((temp = (char *)malloc(400)) == NULL)
 
   saveSettings();
   setAlarm(getNextAlarm());
+}
+
+
+void
+wshandleSeed(void)
+{
+  char  *body;
+
+  if ((body = (char *)malloc(512)) == NULL)
+    return;
+
+  snprintf(body, 512,
+    "<html>\n"
+    "<head>\n"
+    "<title>Feeder [%s]</title>\n"
+    "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
+    "</head>\n"
+    "<body>\n"
+    "<h1>Feeder %s</h1>"
+    "<form method='post' action='/doseed' name='Seed'/>\n"
+      "<label for=weight'>Weight:</label><input name='weight' type='number' value='%5.2f' min='0' max='100' step='0.01'><br><br>\n"
+    "<input name='Save' type='submit' value='Seed'>\n"
+    "</form>"
+    "</body>\n"
+    "</html>", conf.hostname, conf.hostname, dispensedTotal);
+   
+  webserver.send(200, "text/html", body);
+  free(body);
+}
+
+void
+wshandleDoSeed(void)
+{
+  char  *body;
+  String  value;
+
+  if ((body = (char *)malloc(400)) == NULL)
+    return;
+
+  value = webserver.arg("weight");
+  if (value.length() && value.toFloat() >= 0 && value.toFloat() <= 100) {
+    dispensedTotal = value.toFloat();
+  }
+  
+  snprintf(body, 400,
+   "<html>\n"
+   "<head>\n"
+   "<title>Feeder [%s]</title>\n"
+   "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
+   "</head>\n"
+   "<body>\n"
+   "<h1>Feeder %s</h1>"
+   "Set dispensed total: %5.2f"
+   "<meta http-equiv='Refresh' content='3; url=/'>"
+   "</body>\n"
+   "</html>", conf.hostname, conf.hostname, dispensedTotal);
+   
+  webserver.send(200, "text/html", body);
+  free(body);
 }
 
 /*
