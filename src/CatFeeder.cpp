@@ -32,6 +32,7 @@
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
+#include <FRAM.h>
 #include <FastCRC.h>
 #include <HX711.h>
 #include <esp_sntp.h>
@@ -41,8 +42,6 @@
 #include <sys/time.h>
 #include <stdarg.h>
 #include <esp_http_client.h>
-#include <EEPROM.h>      // EEPROM emulation is deprecated.
-#include <Preferences.h> // Convert settings to prefs at some point.
 
 #define MAGIC 0xd41d8cd5
 #define CFG_NCATS 7
@@ -82,6 +81,7 @@ struct cfg {
   } ntfy;
   char      snmpro[64];
   char      snmprw[64];
+  char      timezone[32];
   uint16_t  crc;
 } __attribute__((__packed__));
 
@@ -104,11 +104,20 @@ struct log {
   } data;
 } __attribute__((__packed__));
 
+struct nvdata {
+  uint32_t  magic;
+  uint16_t  state;
+  float     dispensedTotal;
+  time_t    lastDispense;
+  uint16_t  crc;
+} __attribute__((__packed__));
+
 // Bitmap Configuration Flags
 #define CFG_NTFY_ENABLE     0x01
 #define CFG_DISPENSE_CLOSED 0x02
 #define CFG_ENGINEERING     0x04
 #define CFG_SNMP_ENABLE     0x08
+#define CFG_HX711_FAST      0x10
 
 #define CFG_CAT_ACCESS    0x01
 #define CFG_CAT_DISPENSE  0x02
@@ -156,6 +165,7 @@ struct log {
 #define STATE_NO_SCHEDULE   0x0040
 #define STATE_SKIP_DISPENSE 0x0080
 #define STATE_WEIGAND_DONE  0x0100
+#define STATE_FRAM_PRESENT  0x0200
 
 extern const char ca_pem_start[] asm("_binary_src_ca_pem_start");
 extern const char ca_pem_end[] asm("_binary_src_ca_pem_end");
@@ -164,10 +174,7 @@ volatile uint64_t       databits;              // stores all of the data bits
 volatile unsigned char  bitCount;              // number of bits currently captured
 
 time_t        closeTime = 0, lastAuth = 0, bootTime;
-RTC_NOINIT_ATTR volatile uint16_t  state;
-RTC_NOINIT_ATTR float     dispensedTotal;
-RTC_NOINIT_ATTR time_t    lastDispense;
-RTC_NOINIT_ATTR uint32_t  magic;
+volatile struct nvdata    nvdata;
 struct cfg    conf;
 hw_timer_t   *timer;
 
@@ -189,6 +196,8 @@ int checkCard(uint8_t, uint16_t);
 const char *catName(uint8_t, uint16_t);
 float weigh(bool);
 int snmpGetWeight(void);
+int snmpGetTemp(void);
+int snmpGetUptime(void);
 void debug(byte, const char *, ...);
 void ntpCallBack(struct timeval *);
 void wifiEvent(WiFiEvent_t);
@@ -198,11 +207,12 @@ void saveSettings(void);
 void configInit(void);
 void closeDoor(void);
 void openDoor(void);
-void urlDecode(char *);
 void shutdownDoor(void);
 void shutdownAuger(void);
 void enableDoor(void);
 void enableAuger(void);
+void saveNvData(void);
+void loadNvData(void);
 uint8_t getNextAlarm(void);
 uint8_t getCurrentAlarm(void);
 void setAlarm(uint8_t);
@@ -212,14 +222,14 @@ void ntfy(const char *, const char *, const uint8_t, const char *, ...);
 void IRAM_ATTR
 ISR_weigandTimer0(void)
 {
-  state |= STATE_WEIGAND_DONE;
+  nvdata.state |= STATE_WEIGAND_DONE;
 }
 
 // interrupt that happens when INTO goes low (0 bit)
 void IRAM_ATTR
 ISR_D0(void)
 {
-  if (~state & STATE_WEIGAND_DONE) {
+  if (~nvdata.state & STATE_WEIGAND_DONE) {
     timerRestart(timer);
     if (!timerAlarmEnabled(timer))
       timerAlarmEnable(timer);
@@ -232,7 +242,7 @@ ISR_D0(void)
 void IRAM_ATTR
 ISR_D1(void)
 {
-  if (~state & STATE_WEIGAND_DONE) {
+  if (~nvdata.state & STATE_WEIGAND_DONE) {
     timerRestart(timer);
     if (!timerAlarmEnabled(timer))
       timerAlarmEnable(timer);
@@ -245,7 +255,7 @@ ISR_D1(void)
 void IRAM_ATTR
 ISR_RTC(void)
 {
-  state |= STATE_RTC_INTR;
+  nvdata.state |= STATE_RTC_INTR;
 }
 
 #define PIN_HX711_CLK   32
@@ -256,28 +266,35 @@ WebServer   webserver(80);
 RTC_DS3231  rtc;
 WiFiUDP     udp;
 SNMPAgent   snmp;
+FRAM        fram;
 
 void
 setup()
 {
   char      hostname[28];
+  uint16_t  mid, pid;
   timeval   tv;
 
   delay(100);
   Serial.begin(115200);
-  configInit();
-  if (magic != MAGIC) {
-      dispensedTotal = 0;
-      state = 0;
-      lastDispense = time(NULL) - conf.cooloff * 60;
-      magic = MAGIC;
-      debug(true, "Resetting persistent records");
-  }
-  state &= ~(STATE_GOT_TIME | STATE_RTC_PRESENT);
-  state &= ~STATE_WEIGAND_DONE;
+  //if (fram.begin(0x50)) {
+    fram.begin(0x50);
+    pid = fram.getProductID();
+    mid = fram.getManufacturerID();
+    debug(false, "FRAM vendor %u product %u", mid, pid);
+    configInit();
+    loadNvData();
+    nvdata.state |= STATE_FRAM_PRESENT;
+  //}
+  //else {
+  //  debug(false, "FRAM not detected, no configuration");
+  //  state &= ~STATE_FRAM_PRESENT;
+  //}
+  nvdata.state &= ~(STATE_GOT_TIME | STATE_RTC_PRESENT);
+  nvdata.state &= ~STATE_WEIGAND_DONE;
   if (rtc.begin()) {
     debug(false, "RTC present");
-    state |= STATE_RTC_PRESENT;
+    nvdata.state |= STATE_RTC_PRESENT;
     rtc.disable32K();
     rtc.writeSqwPinMode(DS3231_OFF);
     rtc.clearAlarm(1);
@@ -291,24 +308,24 @@ setup()
       tv.tv_sec = now.unixtime();
       tv.tv_usec = 0;
       settimeofday(&tv, NULL);
-      state |= STATE_GOT_TIME;
+      nvdata.state |= STATE_GOT_TIME;
       bootTime = now.unixtime();
     }
   }
   else {
-    state &= ~STATE_RTC_PRESENT;
+    nvdata.state &= ~STATE_RTC_PRESENT;
     debug(false, "No RTC found");
   }
-  configTzTime("EST5EDT,M3.2.0,M11.1.0", conf.ntpserver);
+  configTzTime(conf.timezone, conf.ntpserver);
   sntp_set_time_sync_notification_cb(ntpCallBack);
 
   //RTC is in UTC
   DateTime alarm2(__DATE__, "00:00:00");
   rtc.setAlarm2(alarm2 - getTz(), DS3231_A2_Hour);
-  if (state & STATE_GOT_TIME)
+  if (nvdata.state & STATE_GOT_TIME)
     setAlarm(getNextAlarm());
   else {
-    state |= STATE_NO_SCHEDULE;
+    nvdata.state |= STATE_NO_SCHEDULE;
     rtc.disableAlarm(1);
   }
   pinMode(PIN_RTC_INTR, INPUT_PULLUP);
@@ -317,7 +334,7 @@ setup()
   pinMode(PIN_AUGER_EN, OUTPUT);
   digitalWrite(PIN_AUGER_EN, HIGH);
   pinMode(PIN_AUGER_SLEEP, OUTPUT);
-  digitalWrite(PIN_AUGER_SLEEP, HIGH);
+  digitalWrite(PIN_AUGER_SLEEP, LOW);
   pinMode(PIN_AUGER_DIR, OUTPUT);
   pinMode(PIN_AUGER_STEP, OUTPUT);
   pinMode(PIN_AUGER_MICROSTEP, OUTPUT);
@@ -326,7 +343,7 @@ setup()
   pinMode(PIN_DOOR_EN, OUTPUT);
   digitalWrite(PIN_DOOR_EN, HIGH);
   pinMode(PIN_DOOR_SLEEP, OUTPUT);
-  digitalWrite(PIN_DOOR_SLEEP, HIGH);
+  digitalWrite(PIN_DOOR_SLEEP, LOW);
   pinMode(PIN_DOOR_DIR, OUTPUT);
   pinMode(PIN_DOOR_STEP, OUTPUT);
   pinMode(PIN_DOOR_MICROSTEP, OUTPUT);
@@ -337,9 +354,10 @@ setup()
   pinMode(PIN_CLOSE_LIMIT, INPUT);
   pinMode(PIN_OPEN_LIMIT, INPUT);
   if (!digitalRead(PIN_CLOSE_LIMIT))
-    state |= STATE_OPEN;
+    nvdata.state |= STATE_OPEN;
 
   //connect to WiFi
+  WiFi.onEvent(wifiEvent, ARDUINO_EVENT_WIFI_STA_GOT_IP);
   WiFi.onEvent(wifiEvent, ARDUINO_EVENT_WIFI_STA_CONNECTED);
   WiFi.onEvent(wifiEvent, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   WiFi.onEvent(wifiEvent, ARDUINO_EVENT_WIFI_STA_START);
@@ -347,8 +365,7 @@ setup()
   
   WiFi.disconnect(true);
   delay(100);
-  strcpy(hostname, "CatFeeder-");
-  strcat(hostname, conf.hostname);
+  snprintf(hostname, 28, "CatFeeder-%s", conf.hostname);
   if (WiFi.setHostname(hostname))
     debug(true, "Set hostname to '%s'", hostname);
   else
@@ -358,16 +375,19 @@ setup()
   MDNS.begin(hostname);
   MDNS.addService("http", "tcp", 80);
 
-  pinMode(PIN_HX711_RATE, 0); // 0: 10Hz, 1: 80Hz
-  scale.begin(PIN_HX711_DATA, PIN_HX711_CLK);
+  pinMode(PIN_HX711_RATE, OUTPUT);
+  digitalWrite(PIN_HX711_RATE, 0); // 0: 10Hz, 1: 80Hz
+  scale.begin(PIN_HX711_DATA, PIN_HX711_CLK, 128);
   scale.set_scale(conf.scale);
   scale.set_offset(conf.offset);
-  state &= ~STATE_WEIGHTREPORT;
+  nvdata.state &= ~STATE_WEIGHTREPORT;
 
   snmp = SNMPAgent(conf.snmpro, conf.snmprw);
   snmp.setUDP(&udp);
   snmp.begin();
   snmp.addDynamicIntegerHandler(".1.3.6.1.4.1.5.0", snmpGetWeight);
+  snmp.addDynamicIntegerHandler(".1.3.6.1.4.1.5.1", snmpGetUptime);
+  snmp.addDynamicIntegerHandler(".1.3.6.1.4.1.5.2", snmpGetTemp);
 
   timer = timerBegin(0, 80, true);
   timerAttachInterrupt(timer, &ISR_weigandTimer0, true);
@@ -421,6 +441,7 @@ setup()
   openDoor();
   attachInterrupt(PIN_DATA0, ISR_D0, FALLING);
   attachInterrupt(PIN_DATA1, ISR_D1, FALLING);
+  debug(true, "Ready");
   ntfy(WiFi.getHostname(), "facepalm", 3, "Boot up");
 }
 
@@ -436,8 +457,8 @@ loop()
   if (conf.flags & CFG_SNMP_ENABLE)
     snmp.loop();
 
-  if (state & STATE_RTC_INTR) {
-    state &= ~STATE_RTC_INTR;
+  if (nvdata.state & STATE_RTC_INTR) {
+    nvdata.state &= ~STATE_RTC_INTR;
     if (rtc.alarmFired(1)) {
       uint8_t feedWeight;
       debug(true, "RTC Alarm 1");
@@ -450,44 +471,45 @@ loop()
 
       // We may already have dispensed the quota but that will 
       // be caught later.
-      if (dispensedTotal + feedWeight > conf.quota)
-        feedWeight = abs(conf.quota - dispensedTotal);
+      if (nvdata.dispensedTotal + feedWeight > conf.quota)
+        feedWeight = abs(conf.quota - nvdata.dispensedTotal);
 
-      if (!(conf.schedule[alarmIdx].flags & CFG_SCHED_SKIP && (weigh(true) > feedWeight / 2 || state & STATE_SKIP_DISPENSE))) {
+      if (!(conf.schedule[alarmIdx].flags & CFG_SCHED_SKIP && (weigh(true) > feedWeight / 2 || nvdata.state & STATE_SKIP_DISPENSE))) {
         dispensed = dispense(feedWeight);
-        dispensedTotal += dispensed;
+        nvdata.dispensedTotal += dispensed;
         alarmIdx = getNextAlarm();
-        state |= STATE_SKIP_DISPENSE;
+        nvdata.state |= STATE_SKIP_DISPENSE;
         ntfy(WiFi.getHostname(), "alarm_clock", 3, "Auto-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg\\nNext dispense: %02d:%02d",
-          dispensed, feedWeight, dispensedTotal, conf.quota, conf.schedule[alarmIdx].hour, conf.schedule[alarmIdx].minute);
+          dispensed, feedWeight, nvdata.dispensedTotal, conf.quota, conf.schedule[alarmIdx].hour, conf.schedule[alarmIdx].minute);
       }
       setAlarm(getNextAlarm()); 
     }
     if (rtc.alarmFired(2)) {
       debug(true, "RTC Alarm 2");
       rtc.clearAlarm(2);
-      dispensedTotal = 0;
+      nvdata.dispensedTotal = 0;
       debug(true, "Reset dispensed total");
     }
+    saveNvData();
   }
   
-  if ((~state & STATE_OPEN) && digitalRead(PIN_CLOSE_LIMIT) && time(NULL) > DOOR_TIMEOUT + closeTime)
+  if ((~nvdata.state & STATE_OPEN) && digitalRead(PIN_CLOSE_LIMIT) && time(NULL) > DOOR_TIMEOUT + closeTime)
     openDoor();
   // If the door is supposed to be closed but the limit switch doesn't read closed,
   // Attempt to re-close the door
-  if ((~state & STATE_OPEN) && !digitalRead(PIN_CLOSE_LIMIT)) {
+  if ((~nvdata.state & STATE_OPEN) && !digitalRead(PIN_CLOSE_LIMIT)) {
     debug(true, "Door should be closed, reclosing");
     closeDoor();
   }
 
   weigh(false);
-  if (state & STATE_WEIGHTREPORT && time(NULL) - lastAuth > 120) {
-    ntfy(WiFi.getHostname(), "balance_scale", 3, "End weight: %3.0fg\\nDispensed total: %3.0fg of %dg", weigh(true), dispensedTotal, conf.quota);
-    state &= ~STATE_WEIGHTREPORT;
+  if (nvdata.state & STATE_WEIGHTREPORT && time(NULL) - lastAuth > 120) {
+    ntfy(WiFi.getHostname(), "balance_scale", 3, "End weight: %3.0fg\\nDispensed total: %3.0fg of %dg", weigh(true), nvdata.dispensedTotal, conf.quota);
+    nvdata.state &= ~STATE_WEIGHTREPORT;
   }
 
   // if we have bits and we the weigand transmission timed out
-  if (bitCount > 0 && state & STATE_WEIGAND_DONE) {
+  if (bitCount > 0 && nvdata.state & STATE_WEIGAND_DONE) {
     switch (bitCount) {
       case 26: // standard 26 bit format
         // Even parity over bits 2-13 = bit 1
@@ -502,15 +524,17 @@ loop()
         // you can add other formats if you want!
         // Serial.println("Unable to decode.");
     }
-    if (facilityCode && cardCode)
+    if (facilityCode && cardCode) {
+      debug(true, "Read card: facility %d, card %d", facilityCode, cardCode);
       checkCard(facilityCode, cardCode);
+    }
   }
 
   // cleanup and get ready for the next card
-  if (state & STATE_WEIGAND_DONE) {
+  if (nvdata.state & STATE_WEIGAND_DONE) {
     bitCount = 0;
     databits = 0;
-    state &= ~STATE_WEIGAND_DONE;
+    nvdata.state &= ~STATE_WEIGAND_DONE;
   }
 }
 
@@ -525,15 +549,15 @@ checkCard(uint8_t facilityCode, uint16_t cardCode)
       break;
 
   if (i == CFG_NCATS) {
-    debug(true, "Intruder: %s", catName(facilityCode, cardCode));
+    debug(true, "Intruder: facility %d, card %d", facilityCode, cardCode);
     closeDoor();
     ntfy(WiFi.getHostname(), "no_entry", 3, "Intruder: facility %d, card %d", facilityCode, cardCode);
     return(0);
   }
   if (conf.cat[i].flags & CFG_CAT_ACCESS) {
-    state |= STATE_WEIGHTREPORT;
-    state &= ~STATE_SKIP_DISPENSE;
-    if (~state & STATE_OPEN)
+    nvdata.state |= STATE_WEIGHTREPORT;
+    nvdata.state &= ~STATE_SKIP_DISPENSE;
+    if (~nvdata.state & STATE_OPEN)
       openDoor();
     if (time(NULL) - lastAuth > 120) {
       debug(true, "Authorized: %s", catName(facilityCode, cardCode));
@@ -543,14 +567,16 @@ checkCard(uint8_t facilityCode, uint16_t cardCode)
   }
   else if (conf.cat[i].flags & CFG_CAT_DISPENSE) {
     dispensed = dispense(conf.perFeed);
-    dispensedTotal += dispensed;
-    state |= STATE_SKIP_DISPENSE;
-    ntfy(WiFi.getHostname(), "cook", 3, "Manual-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg", dispensed, conf.perFeed, dispensedTotal, conf.quota);
+    nvdata.dispensedTotal += dispensed;
+    nvdata.state |= STATE_SKIP_DISPENSE;
+    ntfy(WiFi.getHostname(), "cook", 3, "Manual-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg", dispensed, conf.perFeed, nvdata.dispensedTotal, conf.quota);
   }
   else {
     closeDoor();
+    debug(true, "Intruder: %s", catName(facilityCode, cardCode));
     ntfy(WiFi.getHostname(), "no_entry", 3, "Intruder: %s", catName(facilityCode, cardCode));
   }
+  saveNvData();
   return (1);
 }
 
@@ -574,7 +600,7 @@ closeDoor(void)
   int   i;
 
   closeTime = time(NULL);
-  if (digitalRead(PIN_CLOSE_LIMIT) && ~state & STATE_OPEN) // Just reset the open timer if the door is closed
+  if (digitalRead(PIN_CLOSE_LIMIT) && ~nvdata.state & STATE_OPEN) // Just reset the open timer if the door is closed
     return;
   debug(true, "Closing");
   digitalWrite(PIN_DOOR_DIR, DOOR_DIR_CLOSE);
@@ -585,7 +611,7 @@ closeDoor(void)
     delayMicroseconds(1200);
   }
   shutdownDoor();
-  state &= ~STATE_OPEN;
+  nvdata.state &= ~STATE_OPEN;
 }
 
 void
@@ -599,7 +625,7 @@ openDoor(void)
     digitalWrite(PIN_DOOR_STEP, LOW);
     delayMicroseconds(1200);
   }
-  state |= STATE_OPEN;
+  nvdata.state |= STATE_OPEN;
   shutdownDoor();
 }
 
@@ -610,7 +636,7 @@ dispense(int grams)
   float           startWeight = weigh(false), curWeight;
 
   // Override cooloff period if the last dispense didn't fully succeed.
-  if (~state & STATE_CHECK_HOPPER && (time(NULL) < lastDispense + conf.cooloff * 60 || dispensedTotal >= conf.quota))
+  if (~nvdata.state & STATE_CHECK_HOPPER && (time(NULL) < nvdata.lastDispense + conf.cooloff * 60 || nvdata.dispensedTotal >= conf.quota))
     return(0);
 
   debug(true, "Dispense %dg", grams);
@@ -645,11 +671,11 @@ dispense(int grams)
   shutdownAuger();
   if (conf.flags & CFG_DISPENSE_CLOSED)
     openDoor();
-  lastDispense = time(NULL);
-  grams - (curWeight - startWeight) > 3 ? state |= STATE_CHECK_HOPPER : state &= ~STATE_CHECK_HOPPER;
-  if (state & STATE_CHECK_HOPPER)
+  nvdata.lastDispense = time(NULL);
+  grams - (curWeight - startWeight) > 3 ? nvdata.state |= STATE_CHECK_HOPPER : nvdata.state &= ~STATE_CHECK_HOPPER;
+  if (nvdata.state & STATE_CHECK_HOPPER)
     ntfy(WiFi.getHostname(), "warning", 4, "Check Hopper");
-  state |= STATE_SKIP_DISPENSE;
+  nvdata.state |= STATE_SKIP_DISPENSE;
   return(curWeight - startWeight);
 }
 
@@ -657,21 +683,25 @@ void
 shutdownDoor(void)
 {
   digitalWrite(PIN_DOOR_EN, HIGH);
+  digitalWrite(PIN_DOOR_SLEEP, LOW);
 }
 void
 shutdownAuger(void)
 {
   digitalWrite(PIN_AUGER_EN, HIGH);
+  digitalWrite(PIN_AUGER_SLEEP, LOW);
 }
 void
 enableDoor(void)
 {
   digitalWrite(PIN_DOOR_EN, LOW);
+  digitalWrite(PIN_DOOR_SLEEP, HIGH);
 }
 void
 enableAuger(void)
 {
   digitalWrite(PIN_AUGER_EN, LOW);
+  digitalWrite(PIN_AUGER_SLEEP, HIGH);
 }
 
 float
@@ -687,7 +717,7 @@ weigh(bool doAverage)
 
   if (!doAverage)
     return(weight[pos++]);
-  
+
   pos++;
   for (int i = 0; i < 100; i++)
       total += weight[i];
@@ -700,19 +730,31 @@ snmpGetWeight(void)
   return(weigh(true) * 1000);
 }
 
+int
+snmpGetTemp(void)
+{
+  return(rtc.getTemperature()*100);
+}
+
+int
+snmpGetUptime(void)
+{
+  return(time(NULL) - bootTime);
+}
+
 void
 ntpCallBack(struct timeval *tv)
 {
   DateTime  now(tv->tv_sec);
   
-  if (~state & STATE_GOT_TIME) {
+  if (~nvdata.state & STATE_GOT_TIME) {
     setAlarm(getNextAlarm());
     bootTime = tv->tv_sec - millis() / 1000;
   }
   
-  state |= STATE_GOT_TIME;
+  nvdata.state |= STATE_GOT_TIME;
 
-  if (state & STATE_RTC_PRESENT)
+  if (nvdata.state & STATE_RTC_PRESENT)
     rtc.adjust(now);
 }
 
@@ -720,6 +762,9 @@ void
 wifiEvent(WiFiEvent_t event)
 {
   switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      debug(true, "WiFi IP address %s", WiFi.localIP().toString());
+      break;
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
       debug(true, "WiFi Connected");
       break;
@@ -736,16 +781,35 @@ wifiEvent(WiFiEvent_t event)
 }
 
 void
+loadNvData(void)
+{
+  FastCRC16 CRC16;
+  fram.read(sizeof(conf), (uint8_t *)&nvdata, sizeof(nvdata));
+  if (nvdata.magic != MAGIC || nvdata.crc != CRC16.ccitt((uint8_t *)&nvdata, sizeof(struct nvdata) - 2)) {
+    debug(true, "Resetting persistent records");
+    nvdata.dispensedTotal = 0;
+    nvdata.state = 0;
+    nvdata.lastDispense = time(NULL) - conf.cooloff * 60;
+    nvdata.magic = MAGIC;
+  }
+}
+
+void
+saveNvData(void)
+{
+  FastCRC16 CRC16;
+
+  nvdata.crc = CRC16.ccitt((uint8_t *)&nvdata, sizeof(nvdata) - 2);
+  fram.write(sizeof(conf), (uint8_t *)&nvdata, sizeof(nvdata));
+}
+
+void
 saveSettings(void)
 {
   FastCRC16       CRC16;
-  unsigned char  *p;
 
   conf.crc = CRC16.ccitt((uint8_t *)&conf, sizeof(cfg) - 2);
-  p = (unsigned char *)&conf;
-  for (uint16_t i = 0; i < sizeof(struct cfg); i++)
-    EEPROM.write(i, *p++);
-  EEPROM.commit();
+  fram.write(0, (uint8_t *)&conf, sizeof(conf));
 }
 
 void
@@ -757,6 +821,10 @@ defaultSettings(void)
   WiFi.macAddress().toCharArray(conf.hostname, 32);
   strcpy(conf.snmpro, "public");
   strcpy(conf.snmprw, "private");
+  strcpy(conf.timezone, "EST5EDT,M3.2.0,M11.1.0");
+  strcpy(conf.ssid, "WhoRU");
+  strcpy(conf.wpakey, "1609615265");
+  strcpy(conf.ntpserver, "pool.ntp.org");
   conf.magic = MAGIC;
 }
 
@@ -764,12 +832,8 @@ void
 configInit(void)
 {
   FastCRC16        CRC16;
-  unsigned char   *p;
 
-  EEPROM.begin(1024);
-  p = (unsigned char *)&conf;
-  for (uint16_t i = 0; i < sizeof(struct cfg); i++)
-    *p++ = EEPROM.read(i);
+  fram.read(0, (uint8_t *)&conf, sizeof(conf));
   if (conf.magic != MAGIC || conf.crc != CRC16.ccitt((uint8_t *)&conf, sizeof(struct cfg) - 2)) {
     debug(true, "Settings corrupted, defaulting");
     defaultSettings();
@@ -805,8 +869,10 @@ getCurrentAlarm(void)
   DateTime  alarm1;
   int       i;
 
-  alarm1 = rtc.getAlarm1() + getTz();
+  if (nvdata.state & STATE_NO_SCHEDULE)
+    return(CFG_NSCHEDULES);
 
+  alarm1 = rtc.getAlarm1() + getTz();
   for (i = 0; i < CFG_NSCHEDULES; i++) {
     if (~conf.schedule[i].flags & CFG_SCHED_ENABLE)
       continue;
@@ -820,11 +886,11 @@ void
 setAlarm(uint8_t alarm)
 {
   if (alarm >= CFG_NSCHEDULES) {
-    state |= STATE_NO_SCHEDULE;
+    nvdata.state |= STATE_NO_SCHEDULE;
     rtc.disableAlarm(1);
     return;
   }
-  state &= ~STATE_NO_SCHEDULE;
+  nvdata.state &= ~STATE_NO_SCHEDULE;
 
   DateTime  alarm1(2000, 1, 1, conf.schedule[alarm].hour, conf.schedule[alarm].minute, 0);
   rtc.setAlarm1(alarm1 - getTz(), DS3231_A1_Hour);
@@ -852,7 +918,7 @@ debug(byte logtime, const char *format, ...)
   struct tm *tm = localtime(&t);
   
   va_start(pvar, format);
-  if (logtime && state & STATE_GOT_TIME) {
+  if (logtime && nvdata.state & STATE_GOT_TIME) {
     strftime(timestr, 20, "%F %T", tm);
     Serial.print(timestr);
     Serial.print(": "); 
@@ -945,16 +1011,21 @@ ntfy(const char *title, const char *tags, const uint8_t priority, const char *fo
 void
 wshandleRoot(void) {
   char *body;
+  char  timestr[20];
   int sec = time(NULL) - bootTime;
   int min = sec / 60;
   int hr = min / 60;
   char alarm1Date[9] = "hh:mm";
+  time_t     t = time(NULL);
+  struct tm *tm = localtime(&t);
+
+  strftime(timestr, 20, "%F %T", tm);
 
   if ((body = (char *)malloc(1024)) == NULL) {
     debug(true, "WEB / failed to allocate memory");
     return;
   }
-  if (~state & STATE_NO_SCHEDULE) {
+  if (~nvdata.state & STATE_NO_SCHEDULE) {
     DateTime alarm1 = rtc.getAlarm1() + getTz();
     alarm1.toString(alarm1Date);
   }
@@ -967,6 +1038,7 @@ wshandleRoot(void) {
     "</head>"
     "<body>"
       "<h1>Feeder %s</h1>"
+      "%s<br>"
       "%s"
       "<p>Next dispense: %s</p>"
       "<p>Weight: %3.0f g</p>"
@@ -986,9 +1058,10 @@ wshandleRoot(void) {
       "</body>"
     "</html>",
     conf.hostname, conf.hostname,
-    state & STATE_CHECK_HOPPER ? "<p style='color: #AA0000;'>Check Hopper</p>" : "",
-    ~state & STATE_NO_SCHEDULE ? alarm1Date : "No Schedule",
-    weigh(true), dispensedTotal, conf.quota, conf.perFeed,
+    timestr,
+    nvdata.state & STATE_CHECK_HOPPER ? "<p style='color: #AA0000;'>Check Hopper</p>" : "",
+    ~nvdata.state & STATE_NO_SCHEDULE ? alarm1Date : "No Schedule",
+    weigh(true), nvdata.dispensedTotal, conf.quota, conf.perFeed,
     sec / 86400, hr % 24, min % 60, sec % 60,
     sizeof(struct cfg), conf.offset, conf.scale
   );
@@ -1044,8 +1117,8 @@ wshandleConfig(void)
 {
   char  *body, *temp;
 
-  // 6844 characters max body size.
-  if ((body = (char *)malloc(6850)) == NULL)
+  // 6985 characters max body size.
+  if ((body = (char *)malloc(7000)) == NULL)
     return;
   if ((temp = (char *)malloc(600)) == NULL) {
     free(body);
@@ -1053,7 +1126,7 @@ wshandleConfig(void)
   }
   
   // max 2182 characters.
-  snprintf(body, 2648,
+  snprintf(body, 2789,
     "<html>\n"
     "<head>\n"
     "<title>Feeder [%s]</title>\n"
@@ -1068,6 +1141,7 @@ wshandleConfig(void)
         "<label for='key'>WPA Key:</label><input name='key' type='text' value='%s' size='32' maxlength='63'><br>\n"
         "<label for='ntp'>NTP Server:</label><input name='ntp' type='text' value='%s' size='32' maxlength='63' "
           "pattern='^([a-z0-9]+)(\\.)([_a-z0-9]+)((\\.)([_a-z0-9]+))?$' title='A valid hostname'><br>\n"
+        "<label for='tz'>Time Zone spec:</label><input name='tz' type='text' value='%s' size='32' maxlength='32'><br>\n"
         "<label for='quota'>Daily quota:</label><input name='quota' type='number' size='4' value='%d' min='10' max='120'><br>\n"
         "<label for='perfeed'>Per feed:</label><input name='perfeed' type='number' size='4' value='%d' min='1' max='25'><br>\n"
         "<label for='ctf'>Close to feed:</label><input name='ctf' type='checkbox' value='true' %s><br>\n"
@@ -1081,7 +1155,7 @@ wshandleConfig(void)
         "<label for='snmpro'>RO Community:</label><input name='snmpro' type='text' value='%s' size='32' maxlength='63'><br>\n"
         "<label for='snmprw'>RW Community:</label><input name='snmprw' type='text' value='%s' size='32' maxlength='63'><br>\n"
         "<br>\n",
-        conf.hostname, conf.hostname, conf.hostname, conf.ssid, conf.wpakey, conf.ntpserver, conf.quota, conf.perFeed,
+        conf.hostname, conf.hostname, conf.hostname, conf.ssid, conf.wpakey, conf.ntpserver, conf.timezone, conf.quota, conf.perFeed,
         conf.flags & CFG_DISPENSE_CLOSED ? "checked" : "", conf.cooloff,
         conf.flags & CFG_NTFY_ENABLE ? "checked" : "", conf.ntfy.url, conf.ntfy.topic, conf.ntfy.username, conf.ntfy.password,
         conf.flags & CFG_SNMP_ENABLE ? "checked" : "", conf.snmpro, conf.snmprw);
@@ -1117,37 +1191,34 @@ wshandleConfig(void)
 void
 wshandleSave(void)
 {
-  char  *temp;
+  char  *temp, hostname[28];
   String value;
 
   if ((temp = (char *)malloc(400)) == NULL)
     return;
   if (webserver.hasArg("ssid")) {
-    value = webserver.arg("ssid");
-    strncpy(temp, value.c_str(), 399);
-    urlDecode(temp);
-    strncpy(conf.ssid, temp, 63);
+    value = webserver.urlDecode(webserver.arg("ssid"));
+    strncpy(conf.ssid, value.c_str(), 63);
   }
 
   if (webserver.hasArg("key")) {
-    value = webserver.arg("key");
-    strncpy(temp, value.c_str(), 399);
-    urlDecode(temp);
-    strncpy(conf.wpakey, temp, 63);
+    value = webserver.urlDecode(webserver.arg("key"));
+    strncpy(conf.wpakey, value.c_str(), 63);
   }
 
   if (webserver.hasArg("name")) {
-    value = webserver.arg("name");
-    strncpy(temp, value.c_str(), 399);
-    urlDecode(temp);
-    strncpy(conf.hostname, temp, 32);
+    value = webserver.urlDecode(webserver.arg("name"));
+    strncpy(conf.hostname, value.c_str(), 32);
   }
 
   if (webserver.hasArg("ntp")) {
-    value = webserver.arg("ntp");
-    strncpy(temp, value.c_str(), 399);
-    urlDecode(temp);
-    strncpy(conf.ntpserver, temp, 32);
+    value = webserver.urlDecode(webserver.arg("ntp"));
+    strncpy(conf.ntpserver, value.c_str(), 32);
+  }
+
+  if (webserver.hasArg("tz")) {
+    value = webserver.urlDecode(webserver.arg("tz"));
+    strncpy(conf.timezone, value.c_str(), 32);
   }
 
   value = webserver.arg("quota");
@@ -1173,31 +1244,23 @@ wshandleSave(void)
     conf.flags &= ~CFG_NTFY_ENABLE;
 
   if (webserver.hasArg("url")) {
-    value = webserver.arg("url");
-    strncpy(temp, value.c_str(), 399);
-    urlDecode(temp);
-    strncpy(conf.ntfy.url, temp, 64);
+    value = webserver.urlDecode(webserver.arg("url"));
+    strncpy(conf.ntfy.url, value.c_str(), 64);
   }
 
   if (webserver.hasArg("topic")) {
-    value = webserver.arg("topic");
-    strncpy(temp, value.c_str(), 399);
-    urlDecode(temp);
-    strncpy(conf.ntfy.topic, temp, 64);
+    value = webserver.urlDecode(webserver.arg("topic"));
+    strncpy(conf.ntfy.topic, value.c_str(), 64);
   }
 
   if (webserver.hasArg("user")) {
-    value = webserver.arg("user");
-    strncpy(temp, value.c_str(), 399);
-    urlDecode(temp);
-    strncpy(conf.ntfy.username, temp, 16);
+    value = webserver.urlDecode(webserver.arg("user"));
+    strncpy(conf.ntfy.username, value.c_str(), 16);
   }
 
   if (webserver.hasArg("passwd")) {
-    value = webserver.arg("passwd");
-    strncpy(temp, value.c_str(), 399);
-    urlDecode(temp);
-    strncpy(conf.ntfy.password, temp, 16);
+    value = webserver.urlDecode(webserver.arg("passwd"));
+    strncpy(conf.ntfy.password, value.c_str(), 16);
   }
 
   if (webserver.hasArg("snmp"))
@@ -1206,28 +1269,22 @@ wshandleSave(void)
     conf.flags &= ~CFG_SNMP_ENABLE;
 
   if (webserver.hasArg("snmpro")) {
-    value = webserver.arg("snmpro");
-    strncpy(temp, value.c_str(), 399);
-    urlDecode(temp);
-    strncpy(conf.snmpro, temp, 64);
+    value = webserver.urlDecode(webserver.arg("snmpro"));
+    strncpy(conf.snmpro, value.c_str(), 64);
     snmp.setReadOnlyCommunity(conf.snmpro);
   }
 
   if (webserver.hasArg("snmprw")) {
-    value = webserver.arg("snmprw");
-    strncpy(temp, value.c_str(), 399);
-    urlDecode(temp);
-    strncpy(conf.snmprw, temp, 64);
+    value = webserver.urlDecode(webserver.arg("snmprw"));
+    strncpy(conf.snmprw, value.c_str(), 64);
     snmp.setReadWriteCommunity(conf.snmprw);
   }
 
   for (int i=0; i < CFG_NCATS; i++) {
     snprintf(temp, 399, "catname%d", i);
     if (webserver.hasArg(temp)) {
-      value = webserver.arg(temp);
-      strncpy(temp, value.c_str(), 399);
-      urlDecode(temp);
-      strncpy(conf.cat[i].name, temp, 20);
+      value = webserver.urlDecode(webserver.arg(temp));
+      strncpy(conf.cat[i].name, value.c_str(), 20);
     }
 
     snprintf(temp, 399, "facility%d", i);
@@ -1253,7 +1310,10 @@ wshandleSave(void)
       conf.cat[i].flags &= ~CFG_CAT_DISPENSE;
   }
 
-  WiFi.hostname(conf.hostname);
+  snprintf(hostname, 28, "CatFeeder-%s", conf.hostname);
+  WiFi.hostname(hostname);
+  MDNS.setInstanceName(hostname);
+  configTzTime(conf.timezone, conf.ntpserver);
   
   snprintf(temp, 400,
    "<html>\n"
@@ -1304,8 +1364,9 @@ wshandleDoFeed()
   
   if (weight) {
     float dispensed = dispense(weight);
-    dispensedTotal += dispensed;
-    ntfy(WiFi.getHostname(), "desktop_computer", 3, "Web-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg", dispensed, weight, dispensedTotal, conf.quota);
+    nvdata.dispensedTotal += dispensed;
+    saveNvData();
+    ntfy(WiFi.getHostname(), "desktop_computer", 3, "Web-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg", dispensed, weight, nvdata.dispensedTotal, conf.quota);
   }
 }
 
@@ -1314,12 +1375,12 @@ wshandleCalibrate(void)
 {
   char  *body;
 
-  if ((body = (char *)malloc(512)) == NULL)
+  if ((body = (char *)malloc(540)) == NULL)
     return;
 
   scale.set_scale();
   scale.tare(20);
-  snprintf(body, 512,
+  snprintf(body, 540,
     "<html>\n"
     "<head>\n"
     "<title>Feeder [%s]</title>\n"
@@ -1503,7 +1564,7 @@ if ((temp = (char *)malloc(400)) == NULL)
    "<meta http-equiv='Refresh' content='3; url=/'>"
    "</body>\n"
    "</html>", conf.hostname, conf.hostname, webserver.args());
-   
+
   webserver.send(200, "text/html", temp);
   free(temp);
 
@@ -1533,8 +1594,8 @@ wshandleSeed(void)
     "<input name='Save' type='submit' value='Seed'>\n"
     "</form>"
     "</body>\n"
-    "</html>", conf.hostname, conf.hostname, dispensedTotal);
-   
+    "</html>", conf.hostname, conf.hostname, nvdata.dispensedTotal);
+
   webserver.send(200, "text/html", body);
   free(body);
 }
@@ -1550,7 +1611,8 @@ wshandleDoSeed(void)
 
   value = webserver.arg("weight");
   if (value.length() && value.toFloat() >= 0 && value.toFloat() <= 100) {
-    dispensedTotal = value.toFloat();
+    nvdata.dispensedTotal = value.toFloat();
+    saveNvData();
   }
   
   snprintf(body, 400,
@@ -1564,43 +1626,8 @@ wshandleDoSeed(void)
    "Set dispensed total: %5.2f"
    "<meta http-equiv='Refresh' content='3; url=/'>"
    "</body>\n"
-   "</html>", conf.hostname, conf.hostname, dispensedTotal);
-   
+   "</html>", conf.hostname, conf.hostname, nvdata.dispensedTotal);
+
   webserver.send(200, "text/html", body);
   free(body);
-}
-
-/*
- * Convert a single hex digit character to its integer value
- */
-unsigned char
-h2int(char c)
-{
-    if (c >= '0' && c <='9'){
-        return((unsigned char)c - '0');
-    }
-    if (c >= 'a' && c <='f'){
-        return((unsigned char)c - 'a' + 10);
-    }
-    if (c >= 'A' && c <='F'){
-        return((unsigned char)c - 'A' + 10);
-    }
-    return(0);
-}
-
-void
-urlDecode(char *urlbuf)
-{
-  char c;     
-  char *dst = urlbuf;     
-  while ((c = *urlbuf) != 0) {         
-    if (c == '+') c = ' ';         
-    if (c == '%') {             
-      c = *++urlbuf;            
-      c = (h2int(c) << 4) | h2int(*++urlbuf);         
-    }        
-    *dst++ = c;        
-    urlbuf++;     
-  }     
-  *dst = '\0';
 }
