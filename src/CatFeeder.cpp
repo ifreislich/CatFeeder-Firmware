@@ -46,6 +46,14 @@
 #define MAGIC			0xd41d8cd5
 #define CFG_NCATS		7
 #define CFG_NSCHEDULES	10
+
+struct schedule {
+	uint8_t	hour;
+	uint8_t	minute;
+	uint8_t	weight;
+	uint8_t	flags;
+} __attribute__((__packed__));
+
 struct cfg {
 	uint32_t	magic;
 	float		scale;
@@ -66,12 +74,7 @@ struct cfg {
 	uint8_t		perFeed;
 	uint8_t		quota;
 	uint8_t		cooloff;
-	struct {
-		uint8_t	hour;
-		uint8_t	minute;
-		uint8_t	weight;
-		uint8_t	flags;
-	} schedule[CFG_NSCHEDULES];
+	struct schedule schedule[CFG_NSCHEDULES];
 	struct {
 		uint8_t	pad;
 		char	url[64];
@@ -197,6 +200,7 @@ void wshandleDoSeed(void);
 
 int checkCard(uint8_t, uint16_t);
 const char *catName(uint8_t, uint16_t);
+int comparSchedule(const void *, const void *);
 float weigh(bool);
 int snmpGetWeight(void);
 int snmpGetTemp(void);
@@ -917,6 +921,12 @@ getTz(void)
 	return(tz);
 }
 
+int
+comparSchedule(const void *a, const void *b)
+{
+	return(((const struct schedule *)a)->hour * 60 + ((const struct schedule *)a)->minute - ((const struct schedule *)b)->hour * 60 - ((const struct schedule *)b)->minute);
+}
+
 void
 debug(byte logtime, const char *format, ...)
 {
@@ -1619,6 +1629,7 @@ if ((temp = (char *)malloc(400)) == NULL)
 	webserver.send(200, "text/html", temp);
 	free(temp);
 
+	qsort(conf.schedule, CFG_NSCHEDULES, sizeof(struct schedule), comparSchedule);
 	saveSettings();
 	setAlarm(getNextAlarm());
 }
