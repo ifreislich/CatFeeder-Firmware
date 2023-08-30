@@ -113,11 +113,15 @@ struct nvdata {
 } __attribute__((__packed__));
 
 // Bitmap Configuration Flags
-#define CFG_NTFY_ENABLE		0x01
-#define CFG_DISPENSE_CLOSED	0x02
-#define CFG_ENGINEERING		0x04
-#define CFG_SNMP_ENABLE		0x08
-#define CFG_HX711_FAST		0x10
+#define CFG_NTFY_ENABLE		0x0001
+#define CFG_DISPENSE_CLOSED	0x0002
+#define CFG_ENGINEERING		0x0004
+#define CFG_SNMP_ENABLE		0x0008
+#define CFG_HX711_FAST		0x0010
+#define CFG_NTFY_PROBLEM	0x0020
+#define CFG_NTFY_DISPENSE	0x0040
+#define CFG_NTFY_VISIT		0x0080
+#define CFG_NTFY_INTRUDE	0x0100
 
 #define CFG_CAT_ACCESS		0x01
 #define CFG_CAT_DISPENSE	0x02
@@ -472,8 +476,11 @@ loop()
 				nvdata.dispensedTotal += dispensed;
 				alarmIdx = getNextAlarm();
 				nvdata.state |= STATE_SKIP_DISPENSE;
-				ntfy(WiFi.getHostname(), "alarm_clock", 3, "Auto-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg\\nNext dispense: %02d:%02d",
+				debug(true, "Auto-dispense: %3.0fg of %dg Dispensed total: %3.0fg of %dg Next dispense: %02d:%02d",
 					dispensed, feedWeight, nvdata.dispensedTotal, conf.quota, conf.schedule[alarmIdx].hour, conf.schedule[alarmIdx].minute);
+				if (conf.flags & CFG_NTFY_DISPENSE)
+					ntfy(WiFi.getHostname(), "alarm_clock", 3, "Auto-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg\\nNext dispense: %02d:%02d",
+					  dispensed, feedWeight, nvdata.dispensedTotal, conf.quota, conf.schedule[alarmIdx].hour, conf.schedule[alarmIdx].minute);
 			}
 			setAlarm(getNextAlarm()); 
 		}
@@ -497,7 +504,9 @@ loop()
 
 	weigh(false);
 	if (nvdata.state & STATE_WEIGHTREPORT && time(NULL) - lastAuth > 120) {
-		ntfy(WiFi.getHostname(), "balance_scale", 3, "End weight: %3.0fg\\nDispensed total: %3.0fg of %dg", weigh(true), nvdata.dispensedTotal, conf.quota);
+		if (conf.flags & CFG_NTFY_VISIT)
+			ntfy(WiFi.getHostname(), "balance_scale", 3, "End weight: %3.0fg\\nDispensed total: %3.0fg of %dg",
+			  weigh(true), nvdata.dispensedTotal, conf.quota);
 		nvdata.state &= ~STATE_WEIGHTREPORT;
 	}
 
@@ -544,7 +553,8 @@ checkCard(uint8_t facilityCode, uint16_t cardCode)
 	if (i == CFG_NCATS) {
 		debug(true, "Intruder: facility %d, card %d", facilityCode, cardCode);
 		closeDoor();
-		ntfy(WiFi.getHostname(), "no_entry", 3, "Intruder: facility %d, card %d", facilityCode, cardCode);
+		if (conf.flags & CFG_NTFY_INTRUDE)
+			ntfy(WiFi.getHostname(), "no_entry", 3, "Intruder: facility %d, card %d", facilityCode, cardCode);
 		return(0);
 	}
 	if (conf.cat[i].flags & CFG_CAT_ACCESS) {
@@ -554,7 +564,8 @@ checkCard(uint8_t facilityCode, uint16_t cardCode)
 			openDoor();
 		if (time(NULL) - lastAuth > 120) {
 			debug(true, "Authorized: %s", catName(facilityCode, cardCode));
-			ntfy(WiFi.getHostname(), "plate_with_cutlery", 3, "Authorized: %s\\nStart weight: %3.0fg", catName(facilityCode, cardCode), weigh(true));
+			if (conf.flags & CFG_NTFY_VISIT)
+				ntfy(WiFi.getHostname(), "plate_with_cutlery", 3, "Authorized: %s\\nStart weight: %3.0fg", catName(facilityCode, cardCode), weigh(true));
 		}
 		lastAuth = time(NULL);
 	}
@@ -562,12 +573,14 @@ checkCard(uint8_t facilityCode, uint16_t cardCode)
 		dispensed = dispense(conf.perFeed);
 		nvdata.dispensedTotal += dispensed;
 		nvdata.state |= STATE_SKIP_DISPENSE;
-		ntfy(WiFi.getHostname(), "cook", 3, "Manual-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg", dispensed, conf.perFeed, nvdata.dispensedTotal, conf.quota);
+		if (conf.flags & CFG_NTFY_DISPENSE)
+			ntfy(WiFi.getHostname(), "cook", 3, "Manual-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg", dispensed, conf.perFeed, nvdata.dispensedTotal, conf.quota);
 	}
 	else {
 		closeDoor();
 		debug(true, "Intruder: %s", catName(facilityCode, cardCode));
-		ntfy(WiFi.getHostname(), "no_entry", 3, "Intruder: %s", catName(facilityCode, cardCode));
+		if (conf.flags & CFG_NTFY_INTRUDE)
+			ntfy(WiFi.getHostname(), "no_entry", 3, "Intruder: %s", catName(facilityCode, cardCode));
 	}
 	saveNvData();
 	return (1);
@@ -666,7 +679,7 @@ dispense(int grams)
 		openDoor();
 	nvdata.lastDispense = time(NULL);
 	grams - (curWeight - startWeight) > 3 ? nvdata.state |= STATE_CHECK_HOPPER : nvdata.state &= ~STATE_CHECK_HOPPER;
-	if (nvdata.state & STATE_CHECK_HOPPER)
+	if (nvdata.state & STATE_CHECK_HOPPER && conf.flags & CFG_NTFY_PROBLEM)
 		ntfy(WiFi.getHostname(), "warning", 4, "Check Hopper");
 	nvdata.state |= STATE_SKIP_DISPENSE;
 	return(curWeight - startWeight);
@@ -1114,16 +1127,16 @@ wshandleConfig(void)
 {
 	char	*body, *temp;
 
-	// 6985 characters max body size.
-	if ((body = (char *)malloc(7000)) == NULL)
+	// 8498 characters max body size.
+	if ((body = (char *)malloc(8560)) == NULL)
 		return;
-	if ((temp = (char *)malloc(600)) == NULL) {
+	if ((temp = (char *)malloc(690)) == NULL) {
 		free(body);
 		return;
 	}
 	
-	// max 2182 characters.
-	snprintf(body, 2789,
+	// max 3546 characters.
+	snprintf(body, 3550,
 		"<html>\n"
 		"<head>\n"
 		"<title>Feeder [%s]</title>\n"
@@ -1132,41 +1145,60 @@ wshandleConfig(void)
 		"<body>\n"
 		"<h1>Feeder %s</h1>"
 		"<form method='post' action='/save' name='Configuration'/>\n"
-		  "<label for='name'>Feeder Name:</label><input name='name' type='text' value='%s' size='32' maxlength='32' "
-			"pattern='^[A-Za-z0-9_-]+$' title='Letters, numbers, _ and -'><br>\n"
-		  "<label for='ssid'>SSID:</label><input name='ssid' type='text' value='%s' size='32' maxlength='63'><br>\n"
-		  "<label for='key'>WPA Key:</label><input name='key' type='text' value='%s' size='32' maxlength='63'><br>\n"
-		  "<label for='ntp'>NTP Server:</label><input name='ntp' type='text' value='%s' size='32' maxlength='63' "
-			"pattern='^([a-z0-9]+)(\\.)([_a-z0-9]+)((\\.)([_a-z0-9]+))?$' title='A valid hostname'><br>\n"
-		  "<label for='tz'>Time Zone spec:</label><input name='tz' type='text' value='%s' size='32' maxlength='32'><br>\n"
-		  "<label for='quota'>Daily quota:</label><input name='quota' type='number' size='4' value='%d' min='10' max='120'><br>\n"
-		  "<label for='perfeed'>Per feed:</label><input name='perfeed' type='number' size='4' value='%d' min='1' max='25'><br>\n"
-		  "<label for='ctf'>Close to feed:</label><input name='ctf' type='checkbox' value='true' %s><br>\n"
-		  "<label for='cooloff'>Feed cooloff (minutes):</label><input name='cooloff' type='number' size='4' value='%d' min='0' max='120'><br><br>\n"
-		  "<label for='ntfy'>Notifications:</label><input name='ntfy' type='checkbox' value='true' %s><br>\n"
-		  "<label for='url'>Service URL:</label><input name='url' type='text' value='%s' size='32' maxlength='63'><br>\n"
-		  "<label for='topic'>Topic:</label><input name='topic' type='text' value='%s' size='32' maxlength='63'><br>\n"
-		  "<label for='user'>Username:</label><input name='user' type='text' value='%s' size='15' maxlength='15'><br>\n"
-		  "<label for='passwd'>Password:</label><input name='passwd' type='text' value='%s' size='15' maxlength='15'><br><br>\n"
-		  "<label for='snmp'>SNMP:</label><input name='snmp' type='checkbox' value='true' %s><br>\n"
-		  "<label for='snmpro'>RO Community:</label><input name='snmpro' type='text' value='%s' size='32' maxlength='63'><br>\n"
-		  "<label for='snmprw'>RW Community:</label><input name='snmprw' type='text' value='%s' size='32' maxlength='63'><br>\n"
-		  "<br>\n",
+		  "<table border=0 width='520' cellspacing=4 cellpadding=0>\n"
+		  "<tr><td width='30%%'>Feeder Name:</td><td><input name='name' type='text' value='%s' size='32' maxlength='32' "
+			"pattern='^[A-Za-z0-9_-]+$' title='Letters, numbers, _ and -'></td></tr>\n"
+		  "<tr><td width='30%%'>SSID:</td><td><input name='ssid' type='text' value='%s' size='32' maxlength='63'></td></tr>\n"
+		  "<tr><td width='30%%'>WPA Key:</td><td><input name='key' type='text' value='%s' size='32' maxlength='63'></td></tr>\n"
+		  "<tr><td width='30%%'>NTP Server:</td><td><input name='ntp' type='text' value='%s' size='32' maxlength='63' "
+			"pattern='^([a-z0-9]+)(\\.)([_a-z0-9]+)((\\.)([_a-z0-9]+))?$' title='A valid hostname'></td></tr>\n"
+		  "<tr><td width='30%%'>Time Zone spec:</td><td><input name='tz' type='text' value='%s' size='32' maxlength='32'></td></tr>\n"
+		  "<tr><td>&nbsp</td><td>&nbsp</td></tr>"
+		  "<tr><td width='30%%'>Daily quota:</td><td><input name='quota' type='number' size='4' value='%d' min='10' max='120'>grams</td></tr>\n"
+		  "<tr><td width='30%%'>Per feed:</td><td><input name='perfeed' type='number' size='4' value='%d' min='1' max='25'>grams</td></tr>\n"
+		  "<tr><td width='30%%'>Close to feed:</td><td><input name='ctf' type='checkbox' value='true' %s></td></tr>\n"
+		  "<tr><td width='30%%'>Feed cooloff:</td><td><input name='cooloff' type='number' size='4' value='%d' min='0' max='120'> Minutes</td></tr>\n"
+		  "<tr><td>&nbsp</td><td>&nbsp</td></tr>"
+		  "<tr><td width='30%%'>Notifications:</td><td><input name='ntfy' type='checkbox' value='true' %s></td></tr>\n"
+		  "<tr><td width='30%%'>Events:</td><td>"
+			"<table border=0 cellspacing=0 cellpadding=0>\n"
+		  	"<tr><td><input name='ntfy-prob' type='checkbox' value='true' %s>Problems</td></tr>"
+		  	"<tr><td><input name='ntfy-disp' type='checkbox' value='true' %s>Dispense</td></tr>"
+		  	"<tr><td><input name='ntfy-vist' type='checkbox' value='true' %s>Visits</td></tr>"
+		  	"<tr><td><input name='ntfy-ntrd' type='checkbox' value='true' %s>Intruder</td></tr>"
+			"</table>"
+		  	"</td></tr>\n"
+		  "<tr><td width='30%%'>Service URL:</td><td><input name='url' type='text' value='%s' size='32' maxlength='63'></td></tr>\n"
+		  "<tr><td width='30%%'>Topic:</ltd><td><input name='topic' type='text' value='%s' size='32' maxlength='63'></td></tr>\n"
+		  "<tr><td width='30%%'>Username:</td><td><input name='user' type='text' value='%s' size='15' maxlength='15'></td></tr>\n"
+		  "<tr><td width='30%%'>Password:</td><td><input name='passwd' type='text' value='%s' size='15' maxlength='15'></td></tr>\n"
+		  "<tr><td>&nbsp</td><td>&nbsp</td></tr>"
+		  "<tr><td width='30%%'>SNMP:</td><td><input name='snmp' type='checkbox' value='true' %s></td></tr>\n"
+		  "<tr><td width='30%%'>RO Community:</td><td><input name='snmpro' type='text' value='%s' size='32' maxlength='63'></td></tr>\n"
+		  "<tr><td width='30%%'>RW Community:</td><td><input name='snmprw' type='text' value='%s' size='32' maxlength='63'></td></tr>\n"
+		  "</table><p>\n",
 		  conf.hostname, conf.hostname, conf.hostname, conf.ssid, conf.wpakey, conf.ntpserver, conf.timezone, conf.quota, conf.perFeed,
 		  conf.flags & CFG_DISPENSE_CLOSED ? "checked" : "", conf.cooloff,
-		  conf.flags & CFG_NTFY_ENABLE ? "checked" : "", conf.ntfy.url, conf.ntfy.topic, conf.ntfy.username, conf.ntfy.password,
+		  conf.flags & CFG_NTFY_ENABLE ? "checked" : "", 
+		  conf.flags & CFG_NTFY_PROBLEM ? "checked" : "", 
+		  conf.flags & CFG_NTFY_DISPENSE ? "checked" : "", 
+		  conf.flags & CFG_NTFY_VISIT ? "checked" : "", 
+		  conf.flags & CFG_NTFY_INTRUDE ? "checked" : "", 
+		  conf.ntfy.url, conf.ntfy.topic, conf.ntfy.username, conf.ntfy.password,
 		  conf.flags & CFG_SNMP_ENABLE ? "checked" : "", conf.snmpro, conf.snmprw);
 
-	// max 576 characters per cat
+	// max 681 characters per cat
 	for (int i = 0; i < CFG_NCATS; i++) {
-		snprintf(temp, 600,
-		  "<label for='catname%d'>Cat %d:</label><input name='catname%d' type='text' value='%s' size='19' maxlength='19'><br>\n"
-		  "<label for='facility%d'>Facility Code:</label><input name='facility%d' type='number' size='4' value='%d' min='0' max='255'><br>\n"
-		  "<label for='id%d'>Tag ID:</label><input name='id%d' type='number' size='4' value='%d' min='0' max='8191'><br>\n"
-		  "<label for='access%d'>Access:</label><input name='access%d' type='checkbox' value='true' %s><br>\n"
-		  "<label for='dispense%d'>Dispense:</label><input name='dispense%d' type='checkbox' value='true' %s><br><br>\n",
-		  i, i + 1, i, conf.cat[i].name, i, i, conf.cat[i].facility, i, i, conf.cat[i].id, i, i, conf.cat[i].flags & CFG_CAT_ACCESS ? "checked" : "",
-		  i, i, conf.cat[i].flags & CFG_CAT_DISPENSE ? "checked" : ""
+		snprintf(temp, 688,
+		  "<table border=0 width='520' cellspacing=4 cellpadding=0>\n"
+		  "<tr><td width='30%%'><b>Cat %d:</b></td><td><input name='catname%d' type='text' value='%s' size='19' maxlength='19'></td></tr>\n"
+		  "<tr><td width='30%%'>Facility Code:</td><td><input name='facility%d' type='number' size='4' value='%d' min='0' max='255'></td></tr>\n"
+		  "<tr><td width='30%%'>Tag ID:</td><td><input name='id%d' type='number' size='4' value='%d' min='0' max='8191'></td></tr>\n"
+		  "<tr><td width='30%%'>Access:</td><td><input name='access%d' type='checkbox' value='true' %s></td></tr>\n"
+		  "<tr><td width='30%%'>Dispense:</td><td><input name='dispense%d' type='checkbox' value='true' %s></td></tr>\n"
+		  "</table><p>\n",
+		  i + 1, i, conf.cat[i].name, i, conf.cat[i].facility, i, conf.cat[i].id, i, conf.cat[i].flags & CFG_CAT_ACCESS ? "checked" : "",
+		  i, conf.cat[i].flags & CFG_CAT_DISPENSE ? "checked" : ""
 		);
 		strcat(body, temp);
 	}
@@ -1239,6 +1271,26 @@ wshandleSave(void)
 		conf.flags |= CFG_NTFY_ENABLE;
 	else
 		conf.flags &= ~CFG_NTFY_ENABLE;
+
+	if (webserver.hasArg("ntfy-prob"))
+		conf.flags |= CFG_NTFY_PROBLEM;
+	else
+		conf.flags &= ~CFG_NTFY_PROBLEM;
+
+	if (webserver.hasArg("ntfy-disp"))
+		conf.flags |= CFG_NTFY_DISPENSE;
+	else
+		conf.flags &= ~CFG_NTFY_DISPENSE;
+
+	if (webserver.hasArg("ntfy-ntrd"))
+		conf.flags |= CFG_NTFY_INTRUDE;
+	else
+		conf.flags &= ~CFG_NTFY_INTRUDE;
+
+	if (webserver.hasArg("ntfy-vist"))
+		conf.flags |= CFG_NTFY_VISIT;
+	else
+		conf.flags &= ~CFG_NTFY_VISIT;
 
 	if (webserver.hasArg("url")) {
 		value = webserver.urlDecode(webserver.arg("url"));
@@ -1467,7 +1519,7 @@ wshandleSchedule(void)
 
 	if ((body = (char *)malloc(5520)) == NULL)
 		return;
-	if ((temp = (char *)malloc(600)) == NULL) {
+	if ((temp = (char *)malloc(690)) == NULL) {
 		free(body);
 		return;
 	}
@@ -1485,15 +1537,17 @@ wshandleSchedule(void)
 
 	//for (int i = 0; i < CFG_NSCHEDULES; i++) {
 	for (int i = 0; i < 10; i++) {
-		snprintf(temp, 600,
-		  "<label for='t%d'>time:</label><input name='t%d' type='time' value='%02d:%02d'><br>\n"
-		  "<label for='w%d'>Weight:</label><input name='w%d' type='number' value=%d size=3 min=0 max=25><br>\n"
-		  "<label for='e%d'>Enable:</label><input name='e%d' type='checkbox' value='true' %s>\n"
-		  "<label for='s%d'>Allow skip:</label><input name='s%d' type='checkbox' value='true' %s><br><br>\n",
-		  i, i, conf.schedule[i].hour, conf.schedule[i].minute,
-		  i, i, conf.schedule[i].weight,
-		  i, i, conf.schedule[i].flags & CFG_SCHED_ENABLE ? "checked" : "",
-		  i, i, conf.schedule[i].flags & CFG_SCHED_SKIP ? "checked" : ""
+		snprintf(temp, 688,
+		  "<table border=0 width='520' cellspacing=4 cellpadding=0>\n"
+		  "<tr><td width='20%%'><b>Schedule %d:</b></td><td>Enable:<input name='e%d' type='checkbox' value='true' %s>"
+		  "Allow skip:<input name='s%d' type='checkbox' value='true' %s><br></td></tr>\n"
+		  "<tr><td width='20%%'>time:</td><td><input name='t%d' type='time' value='%02d:%02d'></td></tr>\n"
+		  "<tr><td width='20%%'>Weight:</td><td><input name='w%d' type='number' value=%d size=3 min=0 max=25></td></tr>\n"
+		  "</table><p>\n",
+		  i + 1, i, conf.schedule[i].flags & CFG_SCHED_ENABLE ? "checked" : "",
+		  i, conf.schedule[i].flags & CFG_SCHED_SKIP ? "checked" : "",
+		  i, conf.schedule[i].hour, conf.schedule[i].minute,
+		  i, conf.schedule[i].weight
 		);
 		strcat(body, temp);
 	}
