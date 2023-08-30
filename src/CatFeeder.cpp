@@ -125,6 +125,7 @@ struct nvdata {
 #define CFG_NTFY_DISPENSE	0x0040
 #define CFG_NTFY_VISIT		0x0080
 #define CFG_NTFY_INTRUDE	0x0100
+#define CFG_HX711_GAIN_HIGH	0x0200
 
 #define CFG_CAT_ACCESS		0x01
 #define CFG_CAT_DISPENSE	0x02
@@ -157,7 +158,7 @@ struct nvdata {
 #define PIN_DATA0			27
 #define PIN_DATA1			26
 #define WEIGAND_TIMEOUT		20	// timeout in ms on Wiegand sequence 
-#define DOOR_TIMEOUT		60	// Door stays unlocked for max X seconds
+#define DOOR_TIMEOUT		60	// Door stays locked for max X seconds
 
 #define PIN_RTC_INTR		19
 
@@ -195,8 +196,8 @@ void wshandleDoCalibrate(void);
 void wshandleTare(void);
 void wshandleSchedule(void);
 void wshandleScheduleSave(void);
-void wshandleSeed(void);
-void wshandleDoSeed(void);
+void wshandleEngineering(void);
+void wshandleDoEngineering(void);
 
 int checkCard(uint8_t, uint16_t);
 const char *catName(uint8_t, uint16_t);
@@ -377,8 +378,8 @@ setup()
 	MDNS.addService("http", "tcp", 80);
 
 	pinMode(PIN_HX711_RATE, OUTPUT);
-	digitalWrite(PIN_HX711_RATE, 0); // 0: 10Hz, 1: 80Hz
-	scale.begin(PIN_HX711_DATA, PIN_HX711_CLK, 128);
+	digitalWrite(PIN_HX711_RATE, conf.flags & CFG_HX711_FAST ? 1 : 0); // 0: 10Hz, 1: 80Hz
+	scale.begin(PIN_HX711_DATA, PIN_HX711_CLK, conf.flags & CFG_HX711_GAIN_HIGH ? 128 : 64);
 	scale.set_scale(conf.scale);
 	scale.set_offset(conf.offset);
 	nvdata.state &= ~STATE_WEIGHTREPORT;
@@ -430,11 +431,11 @@ setup()
 	webserver.on("/feed", wshandleDoFeed);
 	webserver.on("/calibrate", wshandleCalibrate);
 	webserver.on("/docalibrate", wshandleDoCalibrate);
+	webserver.on("/engineering", wshandleEngineering);
+	webserver.on("/doengineering", wshandleDoEngineering);
 	webserver.on("/tare", wshandleTare);
 	webserver.on("/schedule", wshandleSchedule);
 	webserver.on("/schedulesave", wshandleScheduleSave);
-	webserver.on("/seed", wshandleSeed);
-	webserver.on("/doseed", wshandleDoSeed);
 	webserver.onNotFound(wshandle404);
 	webserver.begin();
 	ArduinoOTA.begin();
@@ -1040,7 +1041,7 @@ wshandleRoot(void) {
 
 	strftime(timestr, 20, "%F %T", tm);
 
-	if ((body = (char *)malloc(1024)) == NULL) {
+	if ((body = (char *)malloc(2048)) == NULL) {
 		debug(true, "WEB / failed to allocate memory");
 		return;
 	}
@@ -1048,7 +1049,7 @@ wshandleRoot(void) {
 		DateTime alarm1 = rtc.getAlarm1() + getTz();
 		alarm1.toString(alarm1Date);
 	}
-	snprintf(body, 1024,
+	snprintf(body, 2048,
 	  "<html>"
 	  "<head>"
 	  "<meta http-equiv='refresh' content='20'/>"
@@ -1064,7 +1065,9 @@ wshandleRoot(void) {
 	  "<p>Dispensed: %3.0f of %3d g</p>"
 	  "<p><a href='/config'>System Configuration</a></p>"
 	  "<p><a href='/schedule'>Feed Dispensing Schedule</a></p>"
-	  "<form method='post' action='/feed' name='Feed'/>\n"
+	  "<p><a href='/tare'>Zero the scale</a></p>"
+	  "%s"
+	  "<form method='post' action='/feed' name='Feed'>\n"
 		"<label for='weight'>Dispense grams:</label><input name='weight' type='number' size='3' value='%d' min='1' max='25'>\n"
 		"<input name='Feed' type='submit' value='Feed'>\n"
 	  "</form>"
@@ -1080,9 +1083,53 @@ wshandleRoot(void) {
 	  timestr,
 	  nvdata.state & STATE_CHECK_HOPPER ? "<p style='color: #AA0000;'>Check Hopper</p>" : "",
 	  ~nvdata.state & STATE_NO_SCHEDULE ? alarm1Date : "No Schedule",
-	  weigh(true), nvdata.dispensedTotal, conf.quota, conf.perFeed,
+	  weigh(true), nvdata.dispensedTotal, conf.quota,
+	  conf.flags & CFG_ENGINEERING ? "<p><a href='/engineering'>Engineering options</a></p>" : "",
+	  conf.perFeed,
 	  sec / 86400, hr % 24, min % 60, sec % 60,
 	  sizeof(struct cfg), conf.offset, conf.scale
+	);
+	webserver.send(200, "text/html", body);
+	free(body);
+}
+
+void
+wshandleEngineering(void) {
+	char		*body;
+
+	if ((body = (char *)malloc(2048)) == NULL) {
+		debug(true, "WEB / failed to allocate memory");
+		return;
+	}
+	snprintf(body, 2048,
+	  "<html>"
+	  "<head>"
+	  "<title>Feeder [%s]</title>"
+	  "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>"
+	  "</head>"
+	  "<body>"
+	  "<h1>Feeder %s</h1>"
+	  "<p><a href='/calibrate'>Calibrate the scale</a></p>"
+	  "<form method='post' action='/doengineering' name='save'>\n"
+	  "<table border=0 width='520' cellspacing=4 cellpadding=0>\n"
+	  "<tr><td width='40%%'>Advanced:</td><td><input name='advanced' type='checkbox' value='true' %s></td>"
+	  "<tr><td width='40%%'>HX711 fast sample rate:</td><td><input name='hx711fast' type='checkbox' value='true' %s></td>"
+	  "<tr><td width='40%%'>HX711 high gain:</td><td><input name='hx711high' type='checkbox' value='true' %s></td></tr>"
+	  "<tr><td width='40%%'>Scale offset:</td><td><input name='offset' type='number' value='%ld'></td></tr>"
+	  "<tr><td width='40%%'>Scale factor:</td><td><input name='factor' type='number' value='%f'></td></tr>"
+	  "<tr><td width='40%%'>Dispensed total:</td><td><input name='weight' type='number' value='%5.2f' min='0' max='100' step='0.01'></td></tr>"
+	  "</table>"
+	  "<input name='Save' type='submit' value='Save'>\n"
+	  "</form>"
+	  "</body>"
+	  "</html>",
+	  conf.hostname, conf.hostname,
+	  conf.flags & CFG_ENGINEERING ? "checked" : "",
+	  conf.flags & CFG_HX711_FAST ? "checked" : "",
+	  conf.flags & CFG_HX711_GAIN_HIGH ? "checked" : "",
+	  conf.offset,
+	  conf.scale,
+	  nvdata.dispensedTotal
 	);
 	webserver.send(200, "text/html", body);
 	free(body);
@@ -1154,7 +1201,7 @@ wshandleConfig(void)
 		"</head>\n"
 		"<body>\n"
 		"<h1>Feeder %s</h1>"
-		"<form method='post' action='/save' name='Configuration'/>\n"
+		"<form method='post' action='/save' name='Configuration'>\n"
 		  "<table border=0 width='520' cellspacing=4 cellpadding=0>\n"
 		  "<tr><td width='30%%'>Feeder Name:</td><td><input name='name' type='text' value='%s' size='32' maxlength='32' "
 			"pattern='^[A-Za-z0-9_-]+$' title='Letters, numbers, _ and -'></td></tr>\n"
@@ -1636,34 +1683,7 @@ if ((temp = (char *)malloc(400)) == NULL)
 
 
 void
-wshandleSeed(void)
-{
-	char	*body;
-
-	if ((body = (char *)malloc(512)) == NULL)
-		return;
-
-	snprintf(body, 512,
-	  "<html>\n"
-	  "<head>\n"
-	  "<title>Feeder [%s]</title>\n"
-	  "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
-	  "</head>\n"
-	  "<body>\n"
-	  "<h1>Feeder %s</h1>"
-	  "<form method='post' action='/doseed' name='Seed'/>\n"
-	  "<label for=weight'>Weight:</label><input name='weight' type='number' value='%5.2f' min='0' max='100' step='0.01'><br><br>\n"
-	  "<input name='Save' type='submit' value='Seed'>\n"
-	  "</form>"
-	  "</body>\n"
-	  "</html>", conf.hostname, conf.hostname, nvdata.dispensedTotal);
-
-	webserver.send(200, "text/html", body);
-	free(body);
-}
-
-void
-wshandleDoSeed(void)
+wshandleDoEngineering(void)
 {
 	char	*body;
 	String	 value;
@@ -1671,12 +1691,39 @@ wshandleDoSeed(void)
 	if ((body = (char *)malloc(400)) == NULL)
 		return;
 
-	value = webserver.arg("weight");
-	if (value.length() && value.toFloat() >= 0 && value.toFloat() <= 100) {
-		nvdata.dispensedTotal = value.toFloat();
-		saveNvData();
+	if (webserver.hasArg("advanced"))
+		conf.flags |= CFG_ENGINEERING;
+	else
+		conf.flags &= ~CFG_ENGINEERING;
+
+	if (webserver.hasArg("hx711fast"))
+		conf.flags |= CFG_HX711_FAST;
+	else
+		conf.flags &= ~CFG_HX711_FAST;
+
+	if (webserver.hasArg("hx711high"))
+		conf.flags |= CFG_HX711_GAIN_HIGH;
+	else
+		conf.flags &= ~CFG_HX711_GAIN_HIGH;
+
+	if (webserver.hasArg("offset")) {
+		value = webserver.arg("offset");
+		conf.offset = value.toInt();
 	}
-	
+
+	if (webserver.hasArg("factor")) {
+		value = webserver.arg("factor");
+		conf.scale = value.toFloat();
+	}
+
+	if (webserver.hasArg("weight")) {
+		value = webserver.arg("weight");
+		if (value.toFloat() >= 0 && value.toFloat() <= 100) {
+			nvdata.dispensedTotal = value.toFloat();
+			saveNvData();
+		}
+	}
+
 	snprintf(body, 400,
 	  "<html>\n"
 	  "<head>\n"
@@ -1685,11 +1732,16 @@ wshandleDoSeed(void)
 	  "</head>\n"
 	  "<body>\n"
 	  "<h1>Feeder %s</h1>"
-	  "Set dispensed total: %5.2f"
+	  "Updated Engineering Conguration, %d items<br>"
 	  "<meta http-equiv='Refresh' content='3; url=/'>"
 	  "</body>\n"
-	  "</html>", conf.hostname, conf.hostname, nvdata.dispensedTotal);
+	  "</html>", conf.hostname, conf.hostname, webserver.args());
 
 	webserver.send(200, "text/html", body);
 	free(body);
+	digitalWrite(PIN_HX711_RATE, conf.flags & CFG_HX711_FAST ? 1 : 0); // 0: 10Hz, 1: 80Hz
+	scale.set_gain(conf.flags & CFG_HX711_GAIN_HIGH ? 128 : 64);
+	scale.set_offset(conf.offset);
+	scale.set_scale(conf.scale);
+	saveSettings();
 }
