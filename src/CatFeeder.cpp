@@ -173,6 +173,9 @@ struct nvdata {
 #define STATE_SKIP_DISPENSE	0x0080
 #define STATE_WEIGAND_DONE	0x0100
 #define STATE_FRAM_PRESENT	0x0200
+#define STATE_MENU_SELECT	0x0400
+#define STATE_MENU_SSID		0x0800
+#define STATE_MENU_PSK		0x1000
 
 extern const char ca_pem_start[] asm("_binary_src_ca_pem_start");
 extern const char ca_pem_end[] asm("_binary_src_ca_pem_end");
@@ -291,7 +294,7 @@ setup()
 	debug(false, "FRAM vendor %u product %u", mid, pid);
 	configInit();
 	loadNvData();
-	nvdata.state |= STATE_FRAM_PRESENT;
+	nvdata.state |= STATE_FRAM_PRESENT | STATE_MENU_SELECT;
 	nvdata.state &= ~(STATE_GOT_TIME | STATE_RTC_PRESENT);
 	nvdata.state &= ~STATE_WEIGAND_DONE;
 	if (rtc.begin()) {
@@ -416,12 +419,23 @@ setup()
 			debug(false, "Received: %7d of %7d", progress, total);
 	})
 	.onError([](ota_error_t error) {
-		debug(true, "Error[%u]: ", error);
-		if (error == OTA_AUTH_ERROR) debug(false, "Auth Failed");
-		else if (error == OTA_BEGIN_ERROR) debug(false, "Begin Failed");
-		else if (error == OTA_CONNECT_ERROR) debug(false, "Connect Failed");
-		else if (error == OTA_RECEIVE_ERROR) debug(false, "Receive Failed");
-		else if (error == OTA_END_ERROR) debug(false, "End Failed");
+		const char	*reason;
+		switch (error) {
+		  case OTA_AUTH_ERROR:
+			reason = "Auth Failed";
+		  case OTA_BEGIN_ERROR:
+			reason = "Begin Failed";
+		  case OTA_CONNECT_ERROR:
+			reason = "Connect Failed";
+		  case OTA_RECEIVE_ERROR:
+			reason = "Receive Failed";
+		  case OTA_END_ERROR:
+			reason = "End Failed";
+		  default:
+			reason = "Undefined";
+		}
+		debug(true, "OTA failed Error[%u]: %s", error, reason);
+		ntfy(WiFi.getHostname(), "warning", 3, "OTA failed: %s", reason);
 	});
 
 	webserver.on("/", wshandleRoot);
@@ -450,6 +464,8 @@ setup()
 void
 loop()
 {
+	static char	 menudata[64];
+	static int	 menupos = 0;
 	uint8_t		 facilityCode = 0, alarmIdx;      // decoded facility code
 	uint16_t	 cardCode = 0;          // decoded card code
 	float		 dispensed;
@@ -458,6 +474,90 @@ loop()
 	webserver.handleClient();
 	if (conf.flags & CFG_SNMP_ENABLE)
 		snmp.loop();
+
+	while (Serial.available()) {
+        menudata[menupos] = Serial.read();
+		if (nvdata.state & (STATE_MENU_PSK | STATE_MENU_SSID)) {
+			if (menudata[menupos] == 8) {
+				if (menupos) {
+					Serial.printf("%c %c", menudata[menupos], menudata[menupos]);
+				}
+				menudata[menupos] = '\0';
+				menupos -= 2;
+			}
+			else
+				Serial.print(menudata[menupos]);
+		}
+
+        if (menupos < 0 || ++menupos == 64)
+            menupos = 0;
+        menudata[menupos] = '\0';
+		if (nvdata.state & STATE_MENU_SELECT && menupos == 1) {
+			switch (menudata[menupos - 1]) {
+			  case 'c':
+				Serial.print("SSID: ");
+				Serial.println(conf.ssid);
+				Serial.print("PSK: ");
+				Serial.println(conf.wpakey);
+				break;
+			  case 'f':
+				nvdata.dispensedTotal = 0;
+				nvdata.state &= STATE_OPEN | STATE_MENU_SELECT;
+				nvdata.lastDispense = time(NULL) - conf.cooloff * 60;
+				nvdata.magic = MAGIC;
+				defaultSettings();
+				Serial.println("Config and persistent data cleared. Write to NVRAM and reboot to commit.");
+				break;
+			  case 'r':
+				Serial.println("Rebooting");
+				ESP.restart();
+				break;
+			  case 's':
+				Serial.print("Enter SSID:");
+				nvdata.state |= STATE_MENU_SSID;
+				nvdata.state &= ~STATE_MENU_SELECT;
+				break;
+			  case 'p':
+				Serial.print("Enter PSK:");
+				nvdata.state |= STATE_MENU_PSK;
+				nvdata.state &= ~STATE_MENU_SELECT;
+				break;
+			  case 'w':
+				saveSettings();
+				saveNvData();
+				Serial.println("Configuration and NVDATA saved");
+				break;
+			  default:
+				Serial.println("Menu");
+				Serial.println("c: Show WiFi config");
+				Serial.println("f: Factory default");
+				Serial.println("s: Set SSID");
+				Serial.println("p: Set WPA2 PSK");
+				Serial.println("w: Write config to NVRAM");
+				Serial.println("r: Reboot");
+				break;
+			}
+			menupos = 0;
+		}
+		if (menupos && (menudata[menupos-1] == '\r' || menudata[menupos-1] == '\n')) {
+			if (nvdata.state & STATE_MENU_SSID) {
+				Serial.println();
+				menudata[menupos-1] = '\0';
+				strncpy(conf.ssid, menudata, 64);
+				Serial.printf("SSID set to '%s'.  Write to NVRAM and reboot to commit.\r\n", conf.ssid);
+			}
+			if (nvdata.state & STATE_MENU_PSK) {
+				Serial.println();
+				menudata[menupos-1] = '\0';
+				strncpy(conf.wpakey, menudata, 64);
+				Serial.printf("WPA2 PSK set to '%s'.  Write to NVRAM and reboot to commit.\r\n", conf.wpakey);
+			}
+			menupos = 0;
+			nvdata.state &= ~(STATE_MENU_SSID | STATE_MENU_PSK);
+			nvdata.state |= STATE_MENU_SELECT;
+		}
+
+    }
 
 	if (nvdata.state & STATE_RTC_INTR) {
 		nvdata.state &= ~STATE_RTC_INTR;
@@ -486,6 +586,14 @@ loop()
 				if (conf.flags & CFG_NTFY_DISPENSE)
 					ntfy(WiFi.getHostname(), "alarm_clock", 3, "Auto-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg\\nNext dispense: %02d:%02d",
 					  dispensed, feedWeight, nvdata.dispensedTotal, conf.quota, conf.schedule[alarmIdx].hour, conf.schedule[alarmIdx].minute);
+			}
+			else {
+				debug(true, "Auto-dispense: Skipped. Dispensed total: %3.0fg of %dg Next dispense: %02d:%02d",
+					nvdata.dispensedTotal, conf.quota, conf.schedule[alarmIdx].hour, conf.schedule[alarmIdx].minute);
+				if (conf.flags & CFG_NTFY_DISPENSE)
+					ntfy(WiFi.getHostname(), "alarm_clock", 3, "Auto-dispense: Skipped\\nDispensed total: %3.0fg of %dg\\nNext dispense: %02d:%02d",
+					  nvdata.dispensedTotal, conf.quota, conf.schedule[alarmIdx].hour, conf.schedule[alarmIdx].minute);
+
 			}
 			setAlarm(getNextAlarm()); 
 		}
@@ -655,7 +763,7 @@ dispense(int grams)
 		closeDoor();
 	enableAuger();
 	// This is a bit of a magic number. 5 revolutions with a reversal
-	// of 0.25 revolution every revolutions dispenses about 10 grams
+	// of 0.25 revolution every revolution dispenses about 10 grams
 	// if the kibbles don't get stuck. So, try rotating 4 as much as
 	// needed which works out to 2 revolution per gram.
 	for(uint8_t i = 0, stop = 0; !stop && i < grams * 2; i++) {
@@ -798,7 +906,7 @@ loadNvData(void)
 
 	fram.read(sizeof(conf), (uint8_t *)&nvdata, sizeof(nvdata));
 	if (nvdata.magic != MAGIC || nvdata.crc != CRC16.ccitt((uint8_t *)&nvdata, sizeof(struct nvdata) - 2)) {
-		debug(true, "Resetting persistent records");
+		debug(false, "Resetting persistent records");
 		nvdata.dispensedTotal = 0;
 		nvdata.state = 0;
 		nvdata.lastDispense = time(NULL) - conf.cooloff * 60;
@@ -835,8 +943,6 @@ defaultSettings(void)
 	strcpy(conf.snmpro, "public");
 	strcpy(conf.snmprw, "private");
 	strcpy(conf.timezone, "EST5EDT,M3.2.0,M11.1.0");
-	strcpy(conf.ssid, "WhoRU");
-	strcpy(conf.wpakey, "1609615265");
 	strcpy(conf.ntpserver, "pool.ntp.org");
 	conf.magic = MAGIC;
 }
@@ -1065,13 +1171,12 @@ wshandleRoot(void) {
 	  "<p>Dispensed: %3.0f of %3d g</p>"
 	  "<p><a href='/config'>System Configuration</a></p>"
 	  "<p><a href='/schedule'>Feed Dispensing Schedule</a></p>"
-	  "<p><a href='/tare'>Zero the scale</a></p>"
-	  "%s"
 	  "<form method='post' action='/feed' name='Feed'>\n"
 		"<label for='weight'>Dispense grams:</label><input name='weight' type='number' size='3' value='%d' min='1' max='25'>\n"
 		"<input name='Feed' type='submit' value='Feed'>\n"
 	  "</form>"
 	  "<p><font size=1>"
+	  "<a href='/tare'>Zero the scale</a></br>"
 	  "Uptime: %d days %02d:%02d:%02d<br>"
 	  "Firmware: " __DATE__ " " __TIME__ "<br>"
 	  "Config Size: %d<br>"
@@ -1084,7 +1189,6 @@ wshandleRoot(void) {
 	  nvdata.state & STATE_CHECK_HOPPER ? "<p style='color: #AA0000;'>Check Hopper</p>" : "",
 	  ~nvdata.state & STATE_NO_SCHEDULE ? alarm1Date : "No Schedule",
 	  weigh(true), nvdata.dispensedTotal, conf.quota,
-	  conf.flags & CFG_ENGINEERING ? "<p><a href='/engineering'>Engineering options</a></p>" : "",
 	  conf.perFeed,
 	  sec / 86400, hr % 24, min % 60, sec % 60,
 	  sizeof(struct cfg), conf.offset, conf.scale
@@ -1192,7 +1296,7 @@ wshandleConfig(void)
 		return;
 	}
 	
-	// max 3546 characters.
+	// max 3492 characters.
 	snprintf(body, 3550,
 		"<html>\n"
 		"<head>\n"
@@ -1259,16 +1363,20 @@ wshandleConfig(void)
 		);
 		strcat(body, temp);
 	}
-	// 185 characters
-	strcat(body,
+	// 239 characters
+	snprintf(temp, 250,
 	  "<input name='Save' type='submit' value='Save'>\n"
 	  "</form>"
 	  "<br>"
 	  "<form method='post' action='/reboot' name='Reboot'>\n"
 		"<input name='Reboot' type='submit' value='Reboot'>\n"
 	  "</form>\n"
+	  "%s"
 	  "</body>\n"
-	  "</html>");
+	  "</html>",
+	  conf.flags & CFG_ENGINEERING ? "<p><a href='/engineering'>Engineering options</a></p>" : ""
+	  );
+	strcat(body, temp);
 	webserver.send(200, "text/html", body);
 	free(body);
 	free(temp);
