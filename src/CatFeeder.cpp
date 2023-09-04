@@ -126,6 +126,7 @@ struct nvdata {
 #define CFG_NTFY_VISIT		0x0080
 #define CFG_NTFY_INTRUDE	0x0100
 #define CFG_HX711_GAIN_HIGH	0x0200
+#define CFG_DOOR_MOTOR_SLOW	0x0400
 
 #define CFG_CAT_ACCESS		0x01
 #define CFG_CAT_DISPENSE	0x02
@@ -402,6 +403,9 @@ setup()
 	ArduinoOTA
 	.onStart([]() {
 		String type;
+
+		shutdownAuger();
+		shutdownDoor();
 		if (ArduinoOTA.getCommand() == U_FLASH)
 		  type = "firmware";
 		else // U_SPIFFS
@@ -499,6 +503,15 @@ loop()
 				Serial.println(conf.ssid);
 				Serial.print("PSK: ");
 				Serial.println(conf.wpakey);
+				Serial.print("IP address: ");
+				Serial.println(WiFi.localIP().toString());
+				WiFi.macAddress().toCharArray(menudata, 64);
+				Serial.print("MAC Address: ");
+				Serial.println(menudata);
+				break;
+			  case 'e':
+				conf.flags |= CFG_ENGINEERING;
+				Serial.println("Engineering settings enabled. Write to NVRAM to save.");
 				break;
 			  case 'f':
 				nvdata.dispensedTotal = 0;
@@ -506,7 +519,10 @@ loop()
 				nvdata.lastDispense = time(NULL) - conf.cooloff * 60;
 				nvdata.magic = MAGIC;
 				defaultSettings();
-				Serial.println("Config and persistent data cleared. Write to NVRAM and reboot to commit.");
+				Serial.println("Config and persistent data cleared. Rebooting...");
+				saveSettings();
+				saveNvData();
+				ESP.restart();
 				break;
 			  case 'r':
 				Serial.println("Rebooting");
@@ -530,6 +546,7 @@ loop()
 			  default:
 				Serial.println("Menu");
 				Serial.println("c: Show WiFi config");
+				Serial.println("e: Enable Engineering settings");
 				Serial.println("f: Factory default");
 				Serial.println("s: Set SSID");
 				Serial.println("p: Set WPA2 PSK");
@@ -544,13 +561,13 @@ loop()
 				Serial.println();
 				menudata[menupos-1] = '\0';
 				strncpy(conf.ssid, menudata, 64);
-				Serial.printf("SSID set to '%s'.  Write to NVRAM and reboot to commit.\r\n", conf.ssid);
+				Serial.printf("SSID set to '%s'.  Write to NVRAM to save and reboot to commit.\r\n", conf.ssid);
 			}
 			if (nvdata.state & STATE_MENU_PSK) {
 				Serial.println();
 				menudata[menupos-1] = '\0';
 				strncpy(conf.wpakey, menudata, 64);
-				Serial.printf("WPA2 PSK set to '%s'.  Write to NVRAM and reboot to commit.\r\n", conf.wpakey);
+				Serial.printf("WPA2 PSK set to '%s'.  Write to NVRAM to save and reboot to commit.\r\n", conf.wpakey);
 			}
 			menupos = 0;
 			nvdata.state &= ~(STATE_MENU_SSID | STATE_MENU_PSK);
@@ -727,7 +744,7 @@ closeDoor(void)
 	for (i = 0; i < 3000 && !digitalRead(PIN_CLOSE_LIMIT); i++) {
 		digitalWrite(PIN_DOOR_STEP, HIGH);
 		digitalWrite(PIN_DOOR_STEP, LOW);
-		delayMicroseconds(1200);
+		delayMicroseconds(conf.flags & CFG_DOOR_MOTOR_SLOW ? 2500 : 1200);
 	}
 	shutdownDoor();
 	nvdata.state &= ~STATE_OPEN;
@@ -742,7 +759,7 @@ openDoor(void)
 	for (int i = 0; i < 3000 && !digitalRead(PIN_OPEN_LIMIT); i++) {
 		digitalWrite(PIN_DOOR_STEP, HIGH);
 		digitalWrite(PIN_DOOR_STEP, LOW);
-		delayMicroseconds(1200);
+		delayMicroseconds(conf.flags & CFG_DOOR_MOTOR_SLOW ? 2500 : 1200);
 	}
 	nvdata.state |= STATE_OPEN;
 	shutdownDoor();
@@ -882,19 +899,19 @@ wifiEvent(WiFiEvent_t event)
 {
 	switch (event) {
 	case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-	  debug(true, "WiFi IP address %s", WiFi.localIP().toString());
+		debug(true, "WiFi IP address %s", WiFi.localIP().toString());
 		break;
-		case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-	  debug(true, "WiFi Connected");
+	case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+		debug(true, "WiFi Connected");
 		break;
-		case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-	  debug(true, "WiFi Disconnected, reconnecting");
+	case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+		debug(true, "WiFi Disconnected, reconnecting");
 		WiFi.begin(conf.ssid, conf.wpakey);
 		break;
-		case ARDUINO_EVENT_WIFI_STA_START:
-	  debug(true, "WiFi Connecting");
+	case ARDUINO_EVENT_WIFI_STA_START:
+		debug(true, "WiFi Connecting");
 		break;
-	  default:
+	default:
 		break;
 	}
 }
@@ -935,10 +952,13 @@ saveSettings(void)
 void
 defaultSettings(void)
 {
-	byte	 addr[8];
+	byte		 addr[8];
+	uint32_t	 flags;
 
-	// Do not clear calibration data 
+	// Do not clear calibration data and Engineering configuration
+	flags = conf.flags & (CFG_HX711_FAST | CFG_HX711_GAIN_HIGH | CFG_DOOR_MOTOR_SLOW);
 	memset(&conf.hostname, '\0', sizeof(struct cfg) - (offsetof(struct cfg, hostname) - offsetof(struct cfg, magic)));
+	conf.flags = flags;
 	WiFi.macAddress().toCharArray(conf.hostname, 32);
 	strcpy(conf.snmpro, "public");
 	strcpy(conf.snmprw, "private");
@@ -1179,9 +1199,7 @@ wshandleRoot(void) {
 	  "<a href='/tare'>Zero the scale</a></br>"
 	  "Uptime: %d days %02d:%02d:%02d<br>"
 	  "Firmware: " __DATE__ " " __TIME__ "<br>"
-	  "Config Size: %d<br>"
-	  "offset: %ld<br>"
-	  "factor: %f</font>\n"
+	  "</font>\n"
 	  "</body>"
 	  "</html>",
 	  conf.hostname, conf.hostname,
@@ -1190,8 +1208,7 @@ wshandleRoot(void) {
 	  ~nvdata.state & STATE_NO_SCHEDULE ? alarm1Date : "No Schedule",
 	  weigh(true), nvdata.dispensedTotal, conf.quota,
 	  conf.perFeed,
-	  sec / 86400, hr % 24, min % 60, sec % 60,
-	  sizeof(struct cfg), conf.offset, conf.scale
+	  sec / 86400, hr % 24, min % 60, sec % 60
 	);
 	webserver.send(200, "text/html", body);
 	free(body);
@@ -1219,21 +1236,25 @@ wshandleEngineering(void) {
 	  "<tr><td width='40%%'>Advanced:</td><td><input name='advanced' type='checkbox' value='true' %s></td>"
 	  "<tr><td width='40%%'>HX711 fast sample rate:</td><td><input name='hx711fast' type='checkbox' value='true' %s></td>"
 	  "<tr><td width='40%%'>HX711 high gain:</td><td><input name='hx711high' type='checkbox' value='true' %s></td></tr>"
+	  "<tr><td width='40%%'>Door stepper slow timing:</td><td><input name='door12v' type='checkbox' value='true' %s></td></tr>"
 	  "<tr><td width='40%%'>Scale offset:</td><td><input name='offset' type='number' value='%ld'></td></tr>"
 	  "<tr><td width='40%%'>Scale factor:</td><td><input name='factor' type='number' value='%f'></td></tr>"
 	  "<tr><td width='40%%'>Dispensed total:</td><td><input name='weight' type='number' value='%5.2f' min='0' max='100' step='0.01'></td></tr>"
 	  "</table>"
 	  "<input name='Save' type='submit' value='Save'>\n"
 	  "</form>"
+	  "<p>Config Size: %d<br>"
 	  "</body>"
 	  "</html>",
 	  conf.hostname, conf.hostname,
 	  conf.flags & CFG_ENGINEERING ? "checked" : "",
 	  conf.flags & CFG_HX711_FAST ? "checked" : "",
 	  conf.flags & CFG_HX711_GAIN_HIGH ? "checked" : "",
+	  conf.flags & CFG_DOOR_MOTOR_SLOW ? "checked" : "",
 	  conf.offset,
 	  conf.scale,
-	  nvdata.dispensedTotal
+	  nvdata.dispensedTotal,
+	  sizeof(struct cfg)
 	);
 	webserver.send(200, "text/html", body);
 	free(body);
@@ -1593,7 +1614,7 @@ wshandleCalibrate(void)
 		return;
 
 	scale.set_scale();
-	scale.tare(20);
+	scale.tare(100);
 	snprintf(body, 540,
 	  "<html>\n"
 	  "<head>\n"
@@ -1813,6 +1834,11 @@ wshandleDoEngineering(void)
 		conf.flags |= CFG_HX711_GAIN_HIGH;
 	else
 		conf.flags &= ~CFG_HX711_GAIN_HIGH;
+
+	if (webserver.hasArg("door12v"))
+		conf.flags |= CFG_DOOR_MOTOR_SLOW;
+	else
+		conf.flags &= ~CFG_DOOR_MOTOR_SLOW;
 
 	if (webserver.hasArg("offset")) {
 		value = webserver.arg("offset");
