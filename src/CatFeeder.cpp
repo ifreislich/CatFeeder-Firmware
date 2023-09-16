@@ -46,6 +46,7 @@
 #define MAGIC			0xd41d8cd5
 #define CFG_NCATS		7
 #define CFG_NSCHEDULES	10
+#define MAX_CERT		6144
 
 struct schedule {
 	uint8_t	hour;
@@ -85,6 +86,7 @@ struct cfg {
 	char		snmpro[64];
 	char		snmprw[64];
 	char		timezone[32];
+	char		cacrt[MAX_CERT + 1];
 	uint16_t	crc;
 } __attribute__((__packed__));
 
@@ -127,6 +129,7 @@ struct nvdata {
 #define CFG_NTFY_INTRUDE	0x0100
 #define CFG_HX711_GAIN_HIGH	0x0200
 #define CFG_DOOR_MOTOR_SLOW	0x0400
+#define CFG_NTFY_AUTH		0x0800
 
 #define CFG_CAT_ACCESS		0x01
 #define CFG_CAT_DISPENSE	0x02
@@ -202,6 +205,8 @@ void wshandleSchedule(void);
 void wshandleScheduleSave(void);
 void wshandleEngineering(void);
 void wshandleDoEngineering(void);
+void wshandleSSL(void);
+void wshandleSaveSSL(void);
 
 int checkCard(uint8_t, uint16_t);
 const char *catName(uint8_t, uint16_t);
@@ -371,7 +376,7 @@ setup()
 	
 	WiFi.disconnect(true);
 	delay(100);
-	snprintf(hostname, 28, "CatFeeder-%s", conf.hostname);
+	snprintf(hostname, 28, "Feeder-%s", conf.hostname);
 	if (WiFi.setHostname(hostname))
 		debug(true, "Set hostname to '%s'", hostname);
 	else
@@ -454,6 +459,8 @@ setup()
 	webserver.on("/tare", wshandleTare);
 	webserver.on("/schedule", wshandleSchedule);
 	webserver.on("/schedulesave", wshandleScheduleSave);
+	webserver.on("/ssl", wshandleSSL);
+	webserver.on("/sslsave", wshandleSaveSSL);
 	webserver.onNotFound(wshandle404);
 	webserver.begin();
 	ArduinoOTA.begin();
@@ -499,15 +506,12 @@ loop()
 		if (nvdata.state & STATE_MENU_SELECT && menupos == 1) {
 			switch (menudata[menupos - 1]) {
 			  case 'c':
-				Serial.print("SSID: ");
-				Serial.println(conf.ssid);
-				Serial.print("PSK: ");
-				Serial.println(conf.wpakey);
-				Serial.print("IP address: ");
-				Serial.println(WiFi.localIP().toString());
+				Serial.printf("SSID: %s\r\n", conf.ssid);
+				Serial.printf("PSK: %s\r\n", conf.wpakey);
+				Serial.printf("IP address: %s\r\n", WiFi.localIP().toString());
 				WiFi.macAddress().toCharArray(menudata, 64);
-				Serial.print("MAC Address: ");
-				Serial.println(menudata);
+				Serial.printf("MAC Address: %s\r\n", menudata);
+				Serial.printf("MDNS Name: feeder-%s.local\r\n", conf.hostname);
 				break;
 			  case 'e':
 				conf.flags |= CFG_ENGINEERING;
@@ -561,13 +565,15 @@ loop()
 				Serial.println();
 				menudata[menupos-1] = '\0';
 				strncpy(conf.ssid, menudata, 64);
-				Serial.printf("SSID set to '%s'.  Write to NVRAM to save and reboot to commit.\r\n", conf.ssid);
+				Serial.printf("SSID set to '%s'.  Write to NVRAM to save.\r\n", conf.ssid);
+				WiFi.begin(conf.ssid, conf.wpakey);
 			}
 			if (nvdata.state & STATE_MENU_PSK) {
 				Serial.println();
 				menudata[menupos-1] = '\0';
 				strncpy(conf.wpakey, menudata, 64);
-				Serial.printf("WPA2 PSK set to '%s'.  Write to NVRAM to save and reboot to commit.\r\n", conf.wpakey);
+				Serial.printf("WPA2 PSK set to '%s'.  Write to NVRAM to save.\r\n", conf.wpakey);
+				WiFi.begin(conf.ssid, conf.wpakey);
 			}
 			menupos = 0;
 			nvdata.state &= ~(STATE_MENU_SSID | STATE_MENU_PSK);
@@ -593,7 +599,7 @@ loop()
 			if (nvdata.dispensedTotal + feedWeight > conf.quota)
 				feedWeight = abs(conf.quota - nvdata.dispensedTotal);
 
-			if (!(conf.schedule[alarmIdx].flags & CFG_SCHED_SKIP && (weigh(true) > feedWeight / 2 || nvdata.state & STATE_SKIP_DISPENSE))) {
+			if (!(conf.schedule[alarmIdx].flags & CFG_SCHED_SKIP && (weigh(true) > feedWeight / 2.0 || nvdata.state & STATE_SKIP_DISPENSE))) {
 				dispensed = dispense(feedWeight);
 				nvdata.dispensedTotal += dispensed;
 				alarmIdx = getNextAlarm();
@@ -605,11 +611,12 @@ loop()
 					  dispensed, feedWeight, nvdata.dispensedTotal, conf.quota, conf.schedule[alarmIdx].hour, conf.schedule[alarmIdx].minute);
 			}
 			else {
+				alarmIdx = getNextAlarm();
 				debug(true, "Auto-dispense: Skipped. Dispensed total: %3.0fg of %dg Next dispense: %02d:%02d",
 					nvdata.dispensedTotal, conf.quota, conf.schedule[alarmIdx].hour, conf.schedule[alarmIdx].minute);
 				if (conf.flags & CFG_NTFY_DISPENSE)
-					ntfy(WiFi.getHostname(), "alarm_clock", 3, "Auto-dispense: Skipped\\nDispensed total: %3.0fg of %dg\\nNext dispense: %02d:%02d",
-					  nvdata.dispensedTotal, conf.quota, conf.schedule[alarmIdx].hour, conf.schedule[alarmIdx].minute);
+					ntfy(WiFi.getHostname(), "alarm_clock", 3, "Auto-dispense: Skipped (%4.1fg)\\nDispensed total: %3.0fg of %dg\\nNext dispense: %02d:%02d",
+					  weigh(true), nvdata.dispensedTotal, conf.quota, conf.schedule[alarmIdx].hour, conf.schedule[alarmIdx].minute);
 
 			}
 			setAlarm(getNextAlarm()); 
@@ -928,6 +935,7 @@ loadNvData(void)
 		nvdata.state = 0;
 		nvdata.lastDispense = time(NULL) - conf.cooloff * 60;
 		nvdata.magic = MAGIC;
+		saveNvData();
 	}
 }
 
@@ -952,14 +960,16 @@ saveSettings(void)
 void
 defaultSettings(void)
 {
-	byte		 addr[8];
+	uint8_t		 mac[6];
 	uint32_t	 flags;
 
 	// Do not clear calibration data and Engineering configuration
 	flags = conf.flags & (CFG_HX711_FAST | CFG_HX711_GAIN_HIGH | CFG_DOOR_MOTOR_SLOW);
 	memset(&conf.hostname, '\0', sizeof(struct cfg) - (offsetof(struct cfg, hostname) - offsetof(struct cfg, magic)));
 	conf.flags = flags;
-	WiFi.macAddress().toCharArray(conf.hostname, 32);
+	WiFi.macAddress(mac);
+	snprintf(conf.hostname, 32, "%02X%02X%02X", mac[3], mac[4], mac[5]);
+	strcpy(conf.cacrt, ca_pem_start);
 	strcpy(conf.snmpro, "public");
 	strcpy(conf.snmprw, "private");
 	strcpy(conf.timezone, "EST5EDT,M3.2.0,M11.1.0");
@@ -1102,10 +1112,10 @@ ntfy(const char *title, const char *tags, const uint8_t priority, const char *fo
 
 	esp_http_client_config_t config = {
 	  .url = conf.ntfy.url,
-	  .username = conf.ntfy.username,
-	  .password = conf.ntfy.password,
-	  .auth_type = HTTP_AUTH_TYPE_BASIC,
-	  .cert_pem = ca_pem_start
+	  .username = conf.flags & CFG_NTFY_AUTH ? conf.ntfy.username : "",
+	  .password = conf.flags & CFG_NTFY_AUTH ?conf.ntfy.password : "",
+	  .auth_type = conf.flags & CFG_NTFY_AUTH ? HTTP_AUTH_TYPE_BASIC : HTTP_AUTH_TYPE_NONE,
+	  .cert_pem = conf.cacrt
 	};
 	esp_http_client_handle_t client = esp_http_client_init(&config);
 	esp_http_client_set_method(client, HTTP_METHOD_POST);
@@ -1231,6 +1241,7 @@ wshandleEngineering(void) {
 	  "<body>"
 	  "<h1>Feeder %s</h1>"
 	  "<p><a href='/calibrate'>Calibrate the scale</a></p>"
+	  "<p><a href='/ssl'>CA Certificate</a></p>"
 	  "<form method='post' action='/doengineering' name='save'>\n"
 	  "<table border=0 width='520' cellspacing=4 cellpadding=0>\n"
 	  "<tr><td width='40%%'>Advanced:</td><td><input name='advanced' type='checkbox' value='true' %s></td>"
@@ -1256,6 +1267,37 @@ wshandleEngineering(void) {
 	  nvdata.dispensedTotal,
 	  sizeof(struct cfg)
 	);
+	webserver.send(200, "text/html", body);
+	free(body);
+}
+
+void
+wshandleSSL()
+{
+	char		*body;
+
+	if ((body = (char *)malloc(MAX_CERT+450)) == NULL) {
+		debug(true, "WEB / failed to allocate memory");
+		return;
+	}
+	// 437 excluding certificate text
+	snprintf(body, MAX_CERT+450,
+	  "<html>"
+	  "<head>"
+	  "<title>Feeder [%s]</title>"
+	  "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>"
+	  "</head>"
+	  "<body>"
+	  "<h1>Feeder %s</h1>"
+	  "<form method='post' action='/sslsave' name='save'>\n"
+	  "<label for='cacrt'>CA Certificate:</label><p><textarea name='cacrt' type='textarea' maxlength=%d rows=20 cols=80>%s</textarea><br>"
+	  "<input name='Save' type='submit' value='Save'>\n"
+	  "</form>"
+	  "</body>"
+	  "</html>",
+	  conf.hostname, conf.hostname, MAX_CERT, conf.cacrt
+	);
+
 	webserver.send(200, "text/html", body);
 	free(body);
 }
@@ -1309,16 +1351,16 @@ wshandleConfig(void)
 {
 	char	*body, *temp;
 
-	// 8498 characters max body size.
-	if ((body = (char *)malloc(8560)) == NULL)
+	// 8736 characters max body size.
+	if ((body = (char *)malloc(8800)) == NULL)
 		return;
 	if ((temp = (char *)malloc(690)) == NULL) {
 		free(body);
 		return;
 	}
 	
-	// max 3492 characters.
-	snprintf(body, 3550,
+	// max 3662 characters.
+	snprintf(body, 3670,
 		"<html>\n"
 		"<head>\n"
 		"<title>Feeder [%s]</title>\n"
@@ -1350,8 +1392,9 @@ wshandleConfig(void)
 		  	"<tr><td><input name='ntfy-ntrd' type='checkbox' value='true' %s>Intruder</td></tr>"
 			"</table>"
 		  	"</td></tr>\n"
-		  "<tr><td width='30%%'>Service URL:</td><td><input name='url' type='text' value='%s' size='32' maxlength='63'></td></tr>\n"
+		  "<tr><td width='30%%'>Service URL:</td><td><input name='url' type='url' value='%s' size='32' maxlength='63'></td></tr>\n"
 		  "<tr><td width='30%%'>Topic:</ltd><td><input name='topic' type='text' value='%s' size='32' maxlength='63'></td></tr>\n"
+		  "<tr><td width='30%%'>NTFY login:</td><td><input name='ntfy-auth' type='checkbox' value='true' %s></td></tr>\n"
 		  "<tr><td width='30%%'>Username:</td><td><input name='user' type='text' value='%s' size='15' maxlength='15'></td></tr>\n"
 		  "<tr><td width='30%%'>Password:</td><td><input name='passwd' type='text' value='%s' size='15' maxlength='15'></td></tr>\n"
 		  "<tr><td>&nbsp</td><td>&nbsp</td></tr>"
@@ -1366,7 +1409,9 @@ wshandleConfig(void)
 		  conf.flags & CFG_NTFY_DISPENSE ? "checked" : "", 
 		  conf.flags & CFG_NTFY_VISIT ? "checked" : "", 
 		  conf.flags & CFG_NTFY_INTRUDE ? "checked" : "", 
-		  conf.ntfy.url, conf.ntfy.topic, conf.ntfy.username, conf.ntfy.password,
+		  conf.ntfy.url, conf.ntfy.topic,
+		  conf.flags & CFG_NTFY_AUTH ? "checked" : "",
+		  conf.ntfy.username, conf.ntfy.password,
 		  conf.flags & CFG_SNMP_ENABLE ? "checked" : "", conf.snmpro, conf.snmprw);
 
 	// max 681 characters per cat
@@ -1412,27 +1457,27 @@ wshandleSave(void)
 	if ((temp = (char *)malloc(400)) == NULL)
 		return;
 	if (webserver.hasArg("ssid")) {
-		value = webserver.urlDecode(webserver.arg("ssid"));
+		value = webserver.arg("ssid");
 		strncpy(conf.ssid, value.c_str(), 63);
 	}
 
 	if (webserver.hasArg("key")) {
-		value = webserver.urlDecode(webserver.arg("key"));
+		value = webserver.arg("key");
 		strncpy(conf.wpakey, value.c_str(), 63);
 	}
 
 	if (webserver.hasArg("name")) {
-		value = webserver.urlDecode(webserver.arg("name"));
+		value = webserver.arg("name");
 		strncpy(conf.hostname, value.c_str(), 32);
 	}
 
 	if (webserver.hasArg("ntp")) {
-		value = webserver.urlDecode(webserver.arg("ntp"));
+		value = webserver.arg("ntp");
 		strncpy(conf.ntpserver, value.c_str(), 32);
 	}
 
 	if (webserver.hasArg("tz")) {
-		value = webserver.urlDecode(webserver.arg("tz"));
+		value = webserver.arg("tz");
 		strncpy(conf.timezone, value.c_str(), 32);
 	}
 
@@ -1458,6 +1503,11 @@ wshandleSave(void)
 	else
 		conf.flags &= ~CFG_NTFY_ENABLE;
 
+	if (webserver.hasArg("ntfy-auth"))
+		conf.flags |= CFG_NTFY_AUTH;
+	else
+		conf.flags &= ~CFG_NTFY_AUTH;
+
 	if (webserver.hasArg("ntfy-prob"))
 		conf.flags |= CFG_NTFY_PROBLEM;
 	else
@@ -1479,22 +1529,22 @@ wshandleSave(void)
 		conf.flags &= ~CFG_NTFY_VISIT;
 
 	if (webserver.hasArg("url")) {
-		value = webserver.urlDecode(webserver.arg("url"));
+		value = webserver.arg("url");
 		strncpy(conf.ntfy.url, value.c_str(), 64);
 	}
 
 	if (webserver.hasArg("topic")) {
-		value = webserver.urlDecode(webserver.arg("topic"));
+		value = webserver.arg("topic");
 		strncpy(conf.ntfy.topic, value.c_str(), 64);
 	}
 
 	if (webserver.hasArg("user")) {
-		value = webserver.urlDecode(webserver.arg("user"));
+		value = webserver.arg("user");
 		strncpy(conf.ntfy.username, value.c_str(), 16);
 	}
 
 	if (webserver.hasArg("passwd")) {
-		value = webserver.urlDecode(webserver.arg("passwd"));
+		value = webserver.arg("passwd");
 		strncpy(conf.ntfy.password, value.c_str(), 16);
 	}
 
@@ -1504,13 +1554,13 @@ wshandleSave(void)
 		conf.flags &= ~CFG_SNMP_ENABLE;
 
 	if (webserver.hasArg("snmpro")) {
-		value = webserver.urlDecode(webserver.arg("snmpro"));
+		value = webserver.arg("snmpro");
 		strncpy(conf.snmpro, value.c_str(), 64);
 		snmp.setReadOnlyCommunity(conf.snmpro);
 	}
 
 	if (webserver.hasArg("snmprw")) {
-		value = webserver.urlDecode(webserver.arg("snmprw"));
+		value = webserver.arg("snmprw");
 		strncpy(conf.snmprw, value.c_str(), 64);
 		snmp.setReadWriteCommunity(conf.snmprw);
 	}
@@ -1545,7 +1595,7 @@ wshandleSave(void)
 			conf.cat[i].flags &= ~CFG_CAT_DISPENSE;
 	}
 
-	snprintf(hostname, 28, "CatFeeder-%s", conf.hostname);
+	snprintf(hostname, 28, "Feeder-%s", conf.hostname);
 	WiFi.hostname(hostname);
 	MDNS.setInstanceName(hostname);
 	configTzTime(conf.timezone, conf.ntpserver);
@@ -1565,6 +1615,39 @@ wshandleSave(void)
 	  
 	webserver.send(200, "text/html", temp);
 	free(temp);
+	saveSettings();
+}
+
+void
+wshandleSaveSSL()
+{
+	String		 value;
+	char		*body;
+
+	if ((body = (char *)malloc(400)) == NULL) {
+		debug(true, "WEB / failed to allocate memory");
+		return;
+	}
+	if (webserver.hasArg("cacrt")) {
+		value = webserver.arg("cacrt");
+		strncpy(conf.cacrt, value.c_str(), 6144);
+	}
+
+	snprintf(body, 400,
+	  "<html>\n"
+	  "<head>\n"
+	  "<title>Feeder [%s]</title>\n"
+	  "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
+	  "</head>\n"
+	  "<body>\n"
+	  "<h1>Feeder %s</h1>"
+	  "Updated conguration, %d items<BR>"
+	  "<meta http-equiv='Refresh' content='3; url=/'>"
+	  "</body>\n"
+	  "</html>", conf.hostname, conf.hostname, webserver.args());
+
+	webserver.send(200, "text/html", body);
+	free(body);
 	saveSettings();
 }
 
