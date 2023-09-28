@@ -41,6 +41,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <stdarg.h>
+#include <EEPROM.h>
 #include <esp_http_client.h>
 
 #define MAGIC			0xd41d8cd5
@@ -180,6 +181,8 @@ struct nvdata {
 #define STATE_MENU_SELECT	0x0400
 #define STATE_MENU_SSID		0x0800
 #define STATE_MENU_PSK		0x1000
+#define STATE_GOT_IP_ADDR	0x2000
+#define STATE_BOOTUP_NTFY	0x4000
 
 extern const char ca_pem_start[] asm("_binary_src_ca_pem_start");
 extern const char ca_pem_end[] asm("_binary_src_ca_pem_end");
@@ -188,7 +191,7 @@ volatile uint64_t		databits;              // stores all of the data bits
 volatile unsigned char	bitCount;              // number of bits currently captured
 
 time_t					 closeTime = 0, lastAuth = 0, bootTime;
-volatile struct nvdata	 nvdata;
+RTC_NOINIT_ATTR volatile struct nvdata	 nvdata;
 struct cfg				 conf;
 hw_timer_t				*timer;
 
@@ -294,15 +297,19 @@ setup()
 
 	delay(100);
 	Serial.begin(115200);
-	fram.begin(0x50);
-	pid = fram.getProductID();
-	mid = fram.getManufacturerID();
-	debug(false, "FRAM vendor %u product %u", mid, pid);
+	if (fram.begin(0x50) == FRAM_OK) {
+		debug(false, "FRAM present");
+		nvdata.state |= STATE_FRAM_PRESENT;
+	}
+	else {
+		debug(false, "FRAM not present, Fallback to flash EEPROM emulation");
+		nvdata.state &= ~STATE_FRAM_PRESENT;
+		EEPROM.begin(8192);
+	}
 	configInit();
 	loadNvData();
-	nvdata.state |= STATE_FRAM_PRESENT | STATE_MENU_SELECT;
-	nvdata.state &= ~(STATE_GOT_TIME | STATE_RTC_PRESENT);
-	nvdata.state &= ~STATE_WEIGAND_DONE;
+	nvdata.state |= STATE_MENU_SELECT;
+	nvdata.state &= ~(STATE_GOT_TIME | STATE_RTC_PRESENT | STATE_WEIGAND_DONE | STATE_GOT_IP_ADDR | STATE_BOOTUP_NTFY);
 	if (rtc.begin()) {
 		debug(false, "RTC present");
 		nvdata.state |= STATE_RTC_PRESENT;
@@ -382,7 +389,8 @@ setup()
 	else
 		debug(true, "Hostname failed");
 	
-	WiFi.begin(conf.ssid, conf.wpakey);
+	if (*conf.ssid && *conf.wpakey)
+		WiFi.begin(conf.ssid, conf.wpakey);
 	MDNS.begin(hostname);
 	MDNS.addService("http", "tcp", 80);
 
@@ -422,6 +430,7 @@ setup()
 	})
 	.onEnd([]() {
 		debug(true, "Rebooting");
+		delay(100);
 	})
 	.onProgress([](unsigned int progress, unsigned int total) {
 		if (!(progress % 73728))
@@ -469,7 +478,7 @@ setup()
 	attachInterrupt(PIN_DATA0, ISR_D0, FALLING);
 	attachInterrupt(PIN_DATA1, ISR_D1, FALLING);
 	debug(true, "Ready");
-	ntfy(WiFi.getHostname(), "facepalm", 3, "Boot up");
+	ntfy(WiFi.getHostname(), "facepalm", 3, "Boot up\\nFirmware: %s %s", __DATE__, __TIME__);
 }
 
 void
@@ -477,7 +486,7 @@ loop()
 {
 	static char	 menudata[64];
 	static int	 menupos = 0;
-	uint8_t		 facilityCode = 0, alarmIdx;      // decoded facility code
+	uint8_t		 facilityCode = 0, alarmIdx, alarmNextIdx;      // decoded facility code
 	uint16_t	 cardCode = 0;          // decoded card code
 	float		 dispensed;
 	
@@ -485,19 +494,21 @@ loop()
 	webserver.handleClient();
 	if (conf.flags & CFG_SNMP_ENABLE)
 		snmp.loop();
-
+	
 	while (Serial.available()) {
-        menudata[menupos] = Serial.read();
+		if (Serial.available())
+			menudata[menupos] = Serial.read();
 		if (nvdata.state & (STATE_MENU_PSK | STATE_MENU_SSID)) {
-			if (menudata[menupos] == 8) {
+			if (menudata[menupos] == 8) { // chr(8) is backspace
 				if (menupos) {
 					Serial.printf("%c %c", menudata[menupos], menudata[menupos]);
 				}
 				menudata[menupos] = '\0';
 				menupos -= 2;
 			}
-			else
+			else if (menudata[menupos] != '\r' && menudata[menupos] != '\n'){
 				Serial.print(menudata[menupos]);
+			}
 		}
 
         if (menupos < 0 || ++menupos == 64)
@@ -506,12 +517,9 @@ loop()
 		if (nvdata.state & STATE_MENU_SELECT && menupos == 1) {
 			switch (menudata[menupos - 1]) {
 			  case 'c':
-				Serial.printf("SSID: %s\r\n", conf.ssid);
-				Serial.printf("PSK: %s\r\n", conf.wpakey);
-				Serial.printf("IP address: %s\r\n", WiFi.localIP().toString());
 				WiFi.macAddress().toCharArray(menudata, 64);
-				Serial.printf("MAC Address: %s\r\n", menudata);
-				Serial.printf("MDNS Name: feeder-%s.local\r\n", conf.hostname);
+				Serial.printf("SSID: %s\r\nPSK: %s\r\nIP address: %s\r\nMAC Address: %s\r\nMDNS Name: feeder-%s.local\r\n",
+					conf.ssid, conf.wpakey, WiFi.localIP().toString(), menudata, conf.hostname);
 				break;
 			  case 'e':
 				conf.flags |= CFG_ENGINEERING;
@@ -547,6 +555,9 @@ loop()
 				saveNvData();
 				Serial.println("Configuration and NVDATA saved");
 				break;
+			  case '\r':
+			  case '\n':
+			  	break;
 			  default:
 				Serial.println("Menu");
 				Serial.println("c: Show WiFi config");
@@ -566,14 +577,16 @@ loop()
 				menudata[menupos-1] = '\0';
 				strncpy(conf.ssid, menudata, 64);
 				Serial.printf("SSID set to '%s'.  Write to NVRAM to save.\r\n", conf.ssid);
-				WiFi.begin(conf.ssid, conf.wpakey);
+				if (*conf.ssid && *conf.wpakey)
+					WiFi.begin(conf.ssid, conf.wpakey);
 			}
 			if (nvdata.state & STATE_MENU_PSK) {
 				Serial.println();
 				menudata[menupos-1] = '\0';
 				strncpy(conf.wpakey, menudata, 64);
 				Serial.printf("WPA2 PSK set to '%s'.  Write to NVRAM to save.\r\n", conf.wpakey);
-				WiFi.begin(conf.ssid, conf.wpakey);
+				if (*conf.ssid && *conf.wpakey)
+					WiFi.begin(conf.ssid, conf.wpakey);
 			}
 			menupos = 0;
 			nvdata.state &= ~(STATE_MENU_SSID | STATE_MENU_PSK);
@@ -586,9 +599,14 @@ loop()
 		nvdata.state &= ~STATE_RTC_INTR;
 		if (rtc.alarmFired(1)) {
 			uint8_t feedWeight;
+			float	curWeight;
+			const char *reason1;
+			const char *reason2;
+
 			debug(true, "RTC Alarm 1");
 			rtc.clearAlarm(1);
 			alarmIdx = getCurrentAlarm();
+			alarmNextIdx = getNextAlarm();
 			if (conf.schedule[alarmIdx].weight)
 			    feedWeight = conf.schedule[alarmIdx].weight;
 			else
@@ -598,28 +616,34 @@ loop()
 			// be caught later.
 			if (nvdata.dispensedTotal + feedWeight > conf.quota)
 				feedWeight = abs(conf.quota - nvdata.dispensedTotal);
+			
+			curWeight = weigh(true);
+			reason1 = weigh(true) > feedWeight / 2.0 ? "High residual weight" : "";
+			reason2 = nvdata.state & STATE_SKIP_DISPENSE ? "No visit after dispense" : "";
 
-			if (!(conf.schedule[alarmIdx].flags & CFG_SCHED_SKIP && (weigh(true) > feedWeight / 2.0 || nvdata.state & STATE_SKIP_DISPENSE))) {
+			if (!((conf.schedule[alarmIdx].flags & CFG_SCHED_SKIP) && (~nvdata.state & STATE_CHECK_HOPPER) && (*reason1 || *reason2))) {
 				dispensed = dispense(feedWeight);
 				nvdata.dispensedTotal += dispensed;
-				alarmIdx = getNextAlarm();
-				nvdata.state |= STATE_SKIP_DISPENSE;
+				if (~nvdata.state & STATE_CHECK_HOPPER && conf.cooloff)
+					nvdata.state |= STATE_SKIP_DISPENSE;
 				debug(true, "Auto-dispense: %3.0fg of %dg Dispensed total: %3.0fg of %dg Next dispense: %02d:%02d",
-					dispensed, feedWeight, nvdata.dispensedTotal, conf.quota, conf.schedule[alarmIdx].hour, conf.schedule[alarmIdx].minute);
+					dispensed, feedWeight, nvdata.dispensedTotal, conf.quota, conf.schedule[alarmNextIdx].hour, conf.schedule[alarmNextIdx].minute);
 				if (conf.flags & CFG_NTFY_DISPENSE)
 					ntfy(WiFi.getHostname(), "alarm_clock", 3, "Auto-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg\\nNext dispense: %02d:%02d",
-					  dispensed, feedWeight, nvdata.dispensedTotal, conf.quota, conf.schedule[alarmIdx].hour, conf.schedule[alarmIdx].minute);
+					  dispensed, feedWeight, nvdata.dispensedTotal, conf.quota, conf.schedule[alarmNextIdx].hour, conf.schedule[alarmNextIdx].minute);
 			}
 			else {
-				alarmIdx = getNextAlarm();
 				debug(true, "Auto-dispense: Skipped. Dispensed total: %3.0fg of %dg Next dispense: %02d:%02d",
-					nvdata.dispensedTotal, conf.quota, conf.schedule[alarmIdx].hour, conf.schedule[alarmIdx].minute);
+					nvdata.dispensedTotal, conf.quota, conf.schedule[alarmNextIdx].hour, conf.schedule[alarmNextIdx].minute);
 				if (conf.flags & CFG_NTFY_DISPENSE)
-					ntfy(WiFi.getHostname(), "alarm_clock", 3, "Auto-dispense: Skipped (%4.1fg)\\nDispensed total: %3.0fg of %dg\\nNext dispense: %02d:%02d",
-					  weigh(true), nvdata.dispensedTotal, conf.quota, conf.schedule[alarmIdx].hour, conf.schedule[alarmIdx].minute);
+					ntfy(WiFi.getHostname(), "alarm_clock", 3, "Auto-dispense: Skipped (%s%s%s)\\n"
+					  "Dispensed total: %3.0fg of %dg\\n"
+					  "Next dispense: %02d:%02d",
+					  reason1, *reason1 && *reason2 ? ", " : "", reason2, nvdata.dispensedTotal, conf.quota,
+					  conf.schedule[alarmNextIdx].hour, conf.schedule[alarmNextIdx].minute);
 
 			}
-			setAlarm(getNextAlarm()); 
+			setAlarm(alarmNextIdx); 
 		}
 		if (rtc.alarmFired(2)) {
 			debug(true, "RTC Alarm 2");
@@ -707,9 +731,13 @@ checkCard(uint8_t facilityCode, uint16_t cardCode)
 		lastAuth = time(NULL);
 	}
 	else if (conf.cat[i].flags & CFG_CAT_DISPENSE) {
-		dispensed = dispense(conf.perFeed);
+		uint8_t feedWeight = conf.perFeed;
+		if (nvdata.dispensedTotal + feedWeight > conf.quota)
+			feedWeight = abs(conf.quota - nvdata.dispensedTotal);
+		dispensed = dispense(feedWeight);
 		nvdata.dispensedTotal += dispensed;
-		nvdata.state |= STATE_SKIP_DISPENSE;
+		if (~nvdata.state & STATE_CHECK_HOPPER && conf.cooloff)
+			nvdata.state |= STATE_SKIP_DISPENSE;
 		if (conf.flags & CFG_NTFY_DISPENSE)
 			ntfy(WiFi.getHostname(), "cook", 3, "Manual-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg", dispensed, conf.perFeed, nvdata.dispensedTotal, conf.quota);
 	}
@@ -907,13 +935,16 @@ wifiEvent(WiFiEvent_t event)
 	switch (event) {
 	case ARDUINO_EVENT_WIFI_STA_GOT_IP:
 		debug(true, "WiFi IP address %s", WiFi.localIP().toString());
+		nvdata.state |= STATE_GOT_IP_ADDR;
 		break;
 	case ARDUINO_EVENT_WIFI_STA_CONNECTED:
 		debug(true, "WiFi Connected");
 		break;
 	case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
 		debug(true, "WiFi Disconnected, reconnecting");
-		WiFi.begin(conf.ssid, conf.wpakey);
+		if (*conf.ssid && *conf.wpakey)
+			WiFi.begin(conf.ssid, conf.wpakey);
+		nvdata.state &= ~STATE_GOT_IP_ADDR;
 		break;
 	case ARDUINO_EVENT_WIFI_STA_START:
 		debug(true, "WiFi Connecting");
@@ -928,7 +959,8 @@ loadNvData(void)
 {
 	FastCRC16	 CRC16;
 
-	fram.read(sizeof(conf), (uint8_t *)&nvdata, sizeof(nvdata));
+	if (nvdata.state & STATE_FRAM_PRESENT)
+		fram.read(sizeof(conf), (uint8_t *)&nvdata, sizeof(nvdata));
 	if (nvdata.magic != MAGIC || nvdata.crc != CRC16.ccitt((uint8_t *)&nvdata, sizeof(struct nvdata) - 2)) {
 		debug(false, "Resetting persistent records");
 		nvdata.dispensedTotal = 0;
@@ -945,7 +977,8 @@ saveNvData(void)
 	FastCRC16	 CRC16;
 
 	nvdata.crc = CRC16.ccitt((uint8_t *)&nvdata, sizeof(nvdata) - 2);
-	fram.write(sizeof(conf), (uint8_t *)&nvdata, sizeof(nvdata));
+	if (nvdata.state & STATE_FRAM_PRESENT)
+		fram.write(sizeof(conf), (uint8_t *)&nvdata, sizeof(nvdata));
 }
 
 void
@@ -954,7 +987,15 @@ saveSettings(void)
 	FastCRC16	 CRC16;
 
 	conf.crc = CRC16.ccitt((uint8_t *)&conf, sizeof(cfg) - 2);
-	fram.write(0, (uint8_t *)&conf, sizeof(conf));
+	if (nvdata.state & STATE_FRAM_PRESENT)
+		fram.write(0, (uint8_t *)&conf, sizeof(conf));
+	else {
+		unsigned char  *p;
+		p = reinterpret_cast<unsigned char *>(&conf);
+		for (uint16_t i = 0; i < sizeof(struct cfg); i++)
+			EEPROM.write(i, *p++);
+		EEPROM.commit();
+	}
 }
 
 void
@@ -963,8 +1004,13 @@ defaultSettings(void)
 	uint8_t		 mac[6];
 	uint32_t	 flags;
 
-	// Do not clear calibration data and Engineering configuration
-	flags = conf.flags & (CFG_HX711_FAST | CFG_HX711_GAIN_HIGH | CFG_DOOR_MOTOR_SLOW);
+	// Do not clear calibration data and Engineering configuration unless MAGIC is wrong
+	if (conf.magic != MAGIC) {
+		conf.offset = SCALE_OFFSET;
+		conf.scale = SCALE_FACTOR;
+		conf.flags |= CFG_HX711_FAST | CFG_HX711_GAIN_HIGH;
+	}
+	flags = conf.flags & (CFG_HX711_FAST | CFG_HX711_GAIN_HIGH | CFG_DOOR_MOTOR_SLOW | CFG_ENGINEERING);
 	memset(&conf.hostname, '\0', sizeof(struct cfg) - (offsetof(struct cfg, hostname) - offsetof(struct cfg, magic)));
 	conf.flags = flags;
 	WiFi.macAddress(mac);
@@ -982,7 +1028,15 @@ configInit(void)
 {
 	FastCRC16	 CRC16;
 
-	fram.read(0, (uint8_t *)&conf, sizeof(conf));
+	if (nvdata.state & STATE_FRAM_PRESENT)
+		fram.read(0, (uint8_t *)&conf, sizeof(conf));
+	else {
+		unsigned char  *p;
+
+		p = reinterpret_cast<unsigned char *>(&conf);
+		for (uint16_t i = 0; i < sizeof(struct cfg); i++)
+			*p++ = EEPROM.read(i);
+	}
 	if (conf.magic != MAGIC || conf.crc != CRC16.ccitt((uint8_t *)&conf, sizeof(struct cfg) - 2)) {
 		debug(true, "Settings corrupted, defaulting");
 		defaultSettings();
@@ -1352,9 +1406,12 @@ wshandleConfig(void)
 	char	*body, *temp;
 
 	// 8736 characters max body size.
-	if ((body = (char *)malloc(8800)) == NULL)
+	if ((body = (char *)malloc(8800)) == NULL) {
+		debug(true, "WEB / failed to allocate 8800 bytes");
 		return;
+	}
 	if ((temp = (char *)malloc(690)) == NULL) {
+		debug(true, "WEB / failed to allocate 690 bytes");
 		free(body);
 		return;
 	}
@@ -1597,6 +1654,8 @@ wshandleSave(void)
 
 	snprintf(hostname, 28, "Feeder-%s", conf.hostname);
 	WiFi.hostname(hostname);
+	if (*conf.ssid && *conf.wpakey)
+		WiFi.begin(conf.ssid, conf.wpakey);
 	MDNS.setInstanceName(hostname);
 	configTzTime(conf.timezone, conf.ntpserver);
 	
