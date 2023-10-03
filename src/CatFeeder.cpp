@@ -43,6 +43,7 @@
 #include <stdarg.h>
 #include <EEPROM.h>
 #include <esp_http_client.h>
+#include <NimBLEDevice.h>
 
 #define MAGIC			0xd41d8cd5
 #define CFG_NCATS		7
@@ -88,37 +89,19 @@ struct cfg {
 	char		snmprw[64];
 	char		timezone[32];
 	char		cacrt[MAX_CERT + 1];
+	uint8_t		BLEtimeout;
 	uint16_t	crc;
-} __attribute__((__packed__));
-
-enum LOG_EVENT {LOG_DISPENSE, LOG_ACCESS, LOG_INTRUDER};
-struct log {
-	time_t			time;
-	enum LOG_EVENT	event;
-	union {
-		struct {
-		  float	weight;
-		} dispense;
-		struct {
-		  uint8_t	facility;
-		  uint16_t	id;
-		} access;
-		struct {
-		  uint8_t	facility;
-		  uint16_t	id;
-		} intruder;
-	} data;
 } __attribute__((__packed__));
 
 struct nvdata {
 	uint32_t	magic;
-	uint16_t	state;
+	uint32_t	state;
 	float		dispensedTotal;
 	time_t		lastDispense;
 	uint16_t	crc;
 } __attribute__((__packed__));
 
-// Bitmap Configuration Flags
+// 32 Bits, Bitmap Configuration Flags
 #define CFG_NTFY_ENABLE		0x0001
 #define CFG_DISPENSE_CLOSED	0x0002
 #define CFG_ENGINEERING		0x0004
@@ -167,22 +150,24 @@ struct nvdata {
 
 #define PIN_RTC_INTR		19
 
-// Bitmap States
-#define STATE_OPEN			0x0001
-#define STATE_WEIGHTREPORT	0x0002
-#define STATE_RTC_PRESENT	0x0004
-#define STATE_RTC_INTR		0x0008
-#define STATE_GOT_TIME		0x0010
-#define STATE_CHECK_HOPPER	0x0020
-#define STATE_NO_SCHEDULE	0x0040
-#define STATE_SKIP_DISPENSE	0x0080
-#define STATE_WEIGAND_DONE	0x0100
-#define STATE_FRAM_PRESENT	0x0200
-#define STATE_MENU_SELECT	0x0400
-#define STATE_MENU_SSID		0x0800
-#define STATE_MENU_PSK		0x1000
-#define STATE_GOT_IP_ADDR	0x2000
-#define STATE_BOOTUP_NTFY	0x4000
+// 32 Bits, Bitmap States.
+#define STATE_OPEN			0x00000001
+#define STATE_WEIGHTREPORT	0x00000002
+#define STATE_RTC_PRESENT	0x00000004
+#define STATE_RTC_INTR		0x00000008
+#define STATE_GOT_TIME		0x00000010
+#define STATE_CHECK_HOPPER	0x00000020
+#define STATE_NO_SCHEDULE	0x00000040
+#define STATE_SKIP_DISPENSE	0x00000080
+#define STATE_WEIGAND_DONE	0x00000100
+#define STATE_UNUSED_0		0x00000200
+#define STATE_MENU_SELECT	0x00000400
+#define STATE_MENU_SSID		0x00000800
+#define STATE_MENU_PSK		0x00001000
+#define STATE_GOT_IP_ADDR	0x00002000
+#define STATE_BOOTUP_NTFY	0x00004000
+#define STATE_BLE_CONNECTED	0x00008000
+#define STATE_BLE_DATA		0x00010000
 
 extern const char ca_pem_start[] asm("_binary_src_ca_pem_start");
 extern const char ca_pem_end[] asm("_binary_src_ca_pem_end");
@@ -191,9 +176,36 @@ volatile uint64_t		databits;              // stores all of the data bits
 volatile unsigned char	bitCount;              // number of bits currently captured
 
 time_t					 closeTime = 0, lastAuth = 0, bootTime;
-RTC_NOINIT_ATTR volatile struct nvdata	 nvdata;
+int						 haveFRAM = 0;
+volatile struct nvdata	 nvdata;
 struct cfg				 conf;
 hw_timer_t				*timer;
+
+NimBLEServer			*pServer = NULL;
+NimBLECharacteristic	*pTxCharacteristic;
+NimBLECharacteristic	*pRxCharacteristic;
+String					 BleData;
+#define UUID_UART		"6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define UUID_RX			"6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define UUID_TX			"6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+class MyServerCallbacks: public BLEServerCallbacks {
+	void onConnect(BLEServer* pServer) {
+		nvdata.state |= STATE_BLE_CONNECTED;
+	}
+
+	void onDisconnect(BLEServer* pServer) {
+		pServer->getAdvertising()->start();
+		nvdata.state &= ~STATE_BLE_CONNECTED;
+	}
+};
+
+class MyCallbacks: public BLECharacteristicCallbacks {
+	void onWrite(BLECharacteristic *pCharacteristic) {
+		BleData = pCharacteristic->getValue();
+		if (BleData.length() > 0)
+			nvdata.state |= STATE_BLE_DATA;
+	}
+};
 
 void wshandleRoot(void);
 void wshandleConfig(void);
@@ -291,25 +303,31 @@ FRAM		fram;
 void
 setup()
 {
-	char		 hostname[28];
-	uint16_t	 mid, pid;
-	timeval		 tv;
+	NimBLEService	*pService;
+	NimBLESecurity	*pSecurity;
+	char			 hostname[28];
+	uint16_t		 mid, pid;
+	timeval			 tv;
 
-	delay(100);
 	Serial.begin(115200);
+	debug(false, "ESP chip: %s, %d Cores", ESP.getChipModel(), ESP.getChipCores());
 	if (fram.begin(0x50) == FRAM_OK) {
 		debug(false, "FRAM present");
-		nvdata.state |= STATE_FRAM_PRESENT;
+		haveFRAM = 1;
 	}
 	else {
 		debug(false, "FRAM not present, Fallback to flash EEPROM emulation");
-		nvdata.state &= ~STATE_FRAM_PRESENT;
+		haveFRAM = 0;
 		EEPROM.begin(8192);
 	}
+	if (Wire.setClock(400000))
+		debug(false, "i2c clock=400kHz");
+	else
+		debug(false, "i2c clock=100kHz");
 	configInit();
 	loadNvData();
 	nvdata.state |= STATE_MENU_SELECT;
-	nvdata.state &= ~(STATE_GOT_TIME | STATE_RTC_PRESENT | STATE_WEIGAND_DONE | STATE_GOT_IP_ADDR | STATE_BOOTUP_NTFY);
+	nvdata.state &= ~(STATE_GOT_TIME | STATE_RTC_PRESENT | STATE_WEIGAND_DONE | STATE_GOT_IP_ADDR | STATE_BOOTUP_NTFY | STATE_BLE_CONNECTED);
 	if (rtc.begin()) {
 		debug(false, "RTC present");
 		nvdata.state |= STATE_RTC_PRESENT;
@@ -347,7 +365,6 @@ setup()
 		rtc.disableAlarm(1);
 	}
 	pinMode(PIN_RTC_INTR, INPUT_PULLUP);
-	attachInterrupt(PIN_RTC_INTR, ISR_RTC, FALLING);
 
 	pinMode(PIN_AUGER_EN, OUTPUT);
 	digitalWrite(PIN_AUGER_EN, HIGH);
@@ -394,6 +411,23 @@ setup()
 	MDNS.begin(hostname);
 	MDNS.addService("http", "tcp", 80);
 
+	NimBLEDevice::init(hostname);
+	NimBLEDevice::setPower(ESP_PWR_LVL_P1);
+	NimBLEDevice::setSecurityAuth(true, true, true);
+	NimBLEDevice::setSecurityPasskey(524316);
+	NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
+	NimBLEDevice::setMTU(517);
+	pServer = NimBLEDevice::createServer();
+	pServer->setCallbacks(new MyServerCallbacks());
+	pService = pServer->createService(UUID_UART);
+	pTxCharacteristic = pService->createCharacteristic(UUID_TX,
+	  NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::READ_AUTHEN | NIMBLE_PROPERTY::NOTIFY);
+	pRxCharacteristic = pService->createCharacteristic(UUID_RX,
+	  NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC | NIMBLE_PROPERTY::WRITE_AUTHEN);
+	pRxCharacteristic->setCallbacks(new MyCallbacks());
+	pService->start();
+	pServer->getAdvertising()->start();
+
 	pinMode(PIN_HX711_RATE, OUTPUT);
 	digitalWrite(PIN_HX711_RATE, conf.flags & CFG_HX711_FAST ? 1 : 0); // 0: 10Hz, 1: 80Hz
 	scale.begin(PIN_HX711_DATA, PIN_HX711_CLK, conf.flags & CFG_HX711_GAIN_HIGH ? 128 : 64);
@@ -430,6 +464,7 @@ setup()
 	})
 	.onEnd([]() {
 		debug(true, "Rebooting");
+		NimBLEDevice::deinit();
 		delay(100);
 	})
 	.onProgress([](unsigned int progress, unsigned int total) {
@@ -477,6 +512,7 @@ setup()
 	openDoor();
 	attachInterrupt(PIN_DATA0, ISR_D0, FALLING);
 	attachInterrupt(PIN_DATA1, ISR_D1, FALLING);
+	attachInterrupt(PIN_RTC_INTR, ISR_RTC, FALLING);
 	debug(true, "Ready");
 	ntfy(WiFi.getHostname(), "facepalm", 3, "Boot up\\nFirmware: %s %s", __DATE__, __TIME__);
 }
@@ -484,8 +520,10 @@ setup()
 void
 loop()
 {
-	static char	 menudata[64];
+	static char	 menudata[128];
 	static int	 menupos = 0;
+	int			 BleDataPos = 0;
+	const char	*text;
 	uint8_t		 facilityCode = 0, alarmIdx, alarmNextIdx;      // decoded facility code
 	uint16_t	 cardCode = 0;          // decoded card code
 	float		 dispensed;
@@ -495,9 +533,14 @@ loop()
 	if (conf.flags & CFG_SNMP_ENABLE)
 		snmp.loop();
 	
-	while (Serial.available()) {
+	while (Serial.available() || nvdata.state & STATE_BLE_DATA) {
 		if (Serial.available())
 			menudata[menupos] = Serial.read();
+		if (nvdata.state & STATE_BLE_DATA) {
+			menudata[menupos] = BleData.charAt(BleDataPos++);
+			if (!(nvdata.state & (STATE_MENU_PSK | STATE_MENU_SSID)) || BleDataPos >= BleData.length())
+				nvdata.state &= ~STATE_BLE_DATA;
+		}
 		if (nvdata.state & (STATE_MENU_PSK | STATE_MENU_SSID)) {
 			if (menudata[menupos] == 8) { // chr(8) is backspace
 				if (menupos) {
@@ -516,14 +559,35 @@ loop()
         menudata[menupos] = '\0';
 		if (nvdata.state & STATE_MENU_SELECT && menupos == 1) {
 			switch (menudata[menupos - 1]) {
-			  case 'c':
-				WiFi.macAddress().toCharArray(menudata, 64);
-				Serial.printf("SSID: %s\r\nPSK: %s\r\nIP address: %s\r\nMAC Address: %s\r\nMDNS Name: feeder-%s.local\r\n",
-					conf.ssid, conf.wpakey, WiFi.localIP().toString(), menudata, conf.hostname);
+			  case 'c': {
+				char	mac[18];
+				WiFi.macAddress().toCharArray(mac, 18);
+				snprintf(menudata, 128, "SSID: %s\r\nPSK: %s\r\nIP address: %s\r\nMAC Address: %s\r\nMDNS Name: feeder-%s.local\r\n",
+					conf.ssid, *conf.wpakey ? "Set" : "Not set", WiFi.localIP().toString().c_str(), mac, conf.hostname);
+				if (nvdata.state & STATE_BLE_CONNECTED) {
+					pTxCharacteristic->setValue((uint8_t *)menudata, strlen(menudata));
+					pTxCharacteristic->notify();
+				}
+				Serial.printf(menudata);
+				break;
+			  }
+			  case 'd':
+				snprintf(menudata, 128, "Removing %d paired devices\r\n", NimBLEDevice::getNumBonds());
+				if (nvdata.state & STATE_BLE_CONNECTED) {
+					pTxCharacteristic->setValue((uint8_t *)menudata, strlen(menudata));
+					pTxCharacteristic->notify();
+				}
+				Serial.printf(menudata);
+				NimBLEDevice::deleteAllBonds();
 				break;
 			  case 'e':
 				conf.flags |= CFG_ENGINEERING;
-				Serial.println("Engineering settings enabled. Write to NVRAM to save.");
+				text = "Engieering settings enabled. Write to NVRAM to save.\r\n";
+				if (nvdata.state & STATE_BLE_CONNECTED) {
+					pTxCharacteristic->setValue((uint8_t *)text, strlen(text));
+					pTxCharacteristic->notify();
+				}
+				Serial.print(text);
 				break;
 			  case 'f':
 				nvdata.dispensedTotal = 0;
@@ -531,42 +595,75 @@ loop()
 				nvdata.lastDispense = time(NULL) - conf.cooloff * 60;
 				nvdata.magic = MAGIC;
 				defaultSettings();
-				Serial.println("Config and persistent data cleared. Rebooting...");
+				text = "Config and persistent data cleared. Rebooting...\r\n";
+				if (nvdata.state & STATE_BLE_CONNECTED) {
+					pTxCharacteristic->setValue((uint8_t *)text, strlen(text));
+					pTxCharacteristic->notify();
+				}
+				Serial.print(text);
 				saveSettings();
 				saveNvData();
+				NimBLEDevice::deinit();
 				ESP.restart();
 				break;
 			  case 'r':
-				Serial.println("Rebooting");
+				text = "Rebooting\r\n";
+				if (nvdata.state & STATE_BLE_CONNECTED) {
+					pTxCharacteristic->setValue((uint8_t *)text, strlen(text));
+					pTxCharacteristic->notify();
+				}
+				Serial.print(text);
+				NimBLEDevice::deinit();
 				ESP.restart();
 				break;
 			  case 's':
-				Serial.print("Enter SSID:");
+				text = "Enter SSID:";
+				if (nvdata.state & STATE_BLE_CONNECTED) {
+					pTxCharacteristic->setValue((uint8_t *)text, strlen(text));
+					pTxCharacteristic->notify();
+				}
+				Serial.print(text);
 				nvdata.state |= STATE_MENU_SSID;
 				nvdata.state &= ~STATE_MENU_SELECT;
 				break;
 			  case 'p':
-				Serial.print("Enter PSK:");
+			  	text = "Enter PSK:";
+				if (nvdata.state & STATE_BLE_CONNECTED) {
+					pTxCharacteristic->setValue((uint8_t *)text, strlen(text));
+					pTxCharacteristic->notify();
+				}
+				Serial.print(text);
 				nvdata.state |= STATE_MENU_PSK;
 				nvdata.state &= ~STATE_MENU_SELECT;
 				break;
 			  case 'w':
 				saveSettings();
 				saveNvData();
-				Serial.println("Configuration and NVDATA saved");
+				text = "Configuration and NVDATA saved\r\n";
+				if (nvdata.state & STATE_BLE_CONNECTED) {
+					pTxCharacteristic->setValue((uint8_t *)text, strlen(text));
+					pTxCharacteristic->notify();
+				}
+				Serial.print(text);
 				break;
 			  case '\r':
 			  case '\n':
 			  	break;
 			  default:
-				Serial.println("Menu");
-				Serial.println("c: Show WiFi config");
-				Serial.println("e: Enable Engineering settings");
-				Serial.println("f: Factory default");
-				Serial.println("s: Set SSID");
-				Serial.println("p: Set WPA2 PSK");
-				Serial.println("w: Write config to NVRAM");
-				Serial.println("r: Reboot");
+				text = "Menu\r\n"
+				"c: Show WiFi config\r\n"
+				"d: Delete BlueTooth pairings\r\n"
+				"e: Enable Engineering settings\r\n"
+				"f: Factory default\r\n"
+				"s: Set SSID\r\n"
+				"p: Set WPA2 PSK\r\n"
+				"w: Write config to NVRAM\r\n"
+				"r: Reboot\r\n";
+				if (nvdata.state & STATE_BLE_CONNECTED) {
+					pTxCharacteristic->setValue((uint8_t *)text, strlen(text));
+					pTxCharacteristic->notify();
+				}
+				Serial.print(text);
 				break;
 			}
 			menupos = 0;
@@ -594,6 +691,12 @@ loop()
 		}
 
     }
+
+	if (NimBLEDevice::getInitialized() && conf.BLEtimeout && !(nvdata.state & STATE_BLE_CONNECTED) &&
+	  nvdata.state & STATE_GOT_TIME && time(NULL) - bootTime > conf.BLEtimeout * 60) {
+		debug(true, "Disabling BlueTooth");
+		NimBLEDevice::deinit();
+	}
 
 	if (nvdata.state & STATE_RTC_INTR) {
 		nvdata.state &= ~STATE_RTC_INTR;
@@ -818,6 +921,7 @@ dispense(int grams)
 	// of 0.25 revolution every revolution dispenses about 10 grams
 	// if the kibbles don't get stuck. So, try rotating 4 as much as
 	// needed which works out to 2 revolution per gram.
+	curWeight = startWeight;
 	for(uint8_t i = 0, stop = 0; !stop && i < grams * 2; i++) {
 		digitalWrite(PIN_AUGER_DIR, AUGER_DIR_CW);
 		for (int i = 0; !stop && i < 3200; i++) {
@@ -878,9 +982,9 @@ enableAuger(void)
 float
 weigh(bool doAverage)
 {
-	static float	 weight[100];
-	static uint8_t	 pos=0;
-	float			 total;
+	static float	 weight[100] = {0};
+	static uint8_t	 pos = 0;
+	float			 total = 0;
 
 	if (pos == 100)
 		pos = 0;
@@ -959,7 +1063,7 @@ loadNvData(void)
 {
 	FastCRC16	 CRC16;
 
-	if (nvdata.state & STATE_FRAM_PRESENT)
+	if (haveFRAM)
 		fram.read(sizeof(conf), (uint8_t *)&nvdata, sizeof(nvdata));
 	if (nvdata.magic != MAGIC || nvdata.crc != CRC16.ccitt((uint8_t *)&nvdata, sizeof(struct nvdata) - 2)) {
 		debug(false, "Resetting persistent records");
@@ -976,9 +1080,10 @@ saveNvData(void)
 {
 	FastCRC16	 CRC16;
 
-	nvdata.crc = CRC16.ccitt((uint8_t *)&nvdata, sizeof(nvdata) - 2);
-	if (nvdata.state & STATE_FRAM_PRESENT)
+	if (haveFRAM) {
+		nvdata.crc = CRC16.ccitt((uint8_t *)&nvdata, sizeof(nvdata) - 2);
 		fram.write(sizeof(conf), (uint8_t *)&nvdata, sizeof(nvdata));
+	}
 }
 
 void
@@ -987,7 +1092,7 @@ saveSettings(void)
 	FastCRC16	 CRC16;
 
 	conf.crc = CRC16.ccitt((uint8_t *)&conf, sizeof(cfg) - 2);
-	if (nvdata.state & STATE_FRAM_PRESENT)
+	if (haveFRAM)
 		fram.write(0, (uint8_t *)&conf, sizeof(conf));
 	else {
 		unsigned char  *p;
@@ -1028,7 +1133,7 @@ configInit(void)
 {
 	FastCRC16	 CRC16;
 
-	if (nvdata.state & STATE_FRAM_PRESENT)
+	if (haveFRAM)
 		fram.read(0, (uint8_t *)&conf, sizeof(conf));
 	else {
 		unsigned char  *p;
@@ -1039,7 +1144,8 @@ configInit(void)
 	}
 	if (conf.magic != MAGIC || conf.crc != CRC16.ccitt((uint8_t *)&conf, sizeof(struct cfg) - 2)) {
 		debug(true, "Settings corrupted, defaulting");
-		defaultSettings();
+		if (conf.magic != MAGIC)
+			defaultSettings();
 		saveSettings();
 	}
 	scale.set_scale(conf.scale);
@@ -1122,7 +1228,7 @@ void
 debug(byte logtime, const char *format, ...)
 {
 	va_list    pvar;
-	char       str[60];
+	char       str[128];
 	char       timestr[20];
 	time_t     t = time(NULL);
 	struct tm *tm = localtime(&t);
@@ -1133,8 +1239,13 @@ debug(byte logtime, const char *format, ...)
 		Serial.print(timestr);
 		Serial.print(": "); 
 	}
-	vsnprintf(str, 60, format, pvar);
+	vsnprintf(str, 125, format, pvar);
 	Serial.println(str);
+	if (nvdata.state & STATE_BLE_CONNECTED) {
+		strcat(str, "\r\n");
+		pTxCharacteristic->setValue((uint8_t *)str, strlen(str));
+		pTxCharacteristic->notify();
+	}
 	va_end(pvar);
 }
 
@@ -1378,6 +1489,7 @@ wshandleReboot()
 	webserver.send(200, "text/html", body);
 	free(body);
 	delay(100);
+	NimBLEDevice::deinit();
 	ESP.restart();
 }
 
@@ -1431,6 +1543,7 @@ wshandleConfig(void)
 			"pattern='^[A-Za-z0-9_-]+$' title='Letters, numbers, _ and -'></td></tr>\n"
 		  "<tr><td width='30%%'>SSID:</td><td><input name='ssid' type='text' value='%s' size='32' maxlength='63'></td></tr>\n"
 		  "<tr><td width='30%%'>WPA Key:</td><td><input name='key' type='text' value='%s' size='32' maxlength='63'></td></tr>\n"
+		  "<tr><td width='30%%'>BLE enable time:</td><td><input name='ble' type='number' value='%d' size='4' min='0' max='255'>Minutes</td></tr>\n"
 		  "<tr><td width='30%%'>NTP Server:</td><td><input name='ntp' type='text' value='%s' size='32' maxlength='63' "
 			"pattern='^([a-z0-9]+)(\\.)([_a-z0-9]+)((\\.)([_a-z0-9]+))?$' title='A valid hostname'></td></tr>\n"
 		  "<tr><td width='30%%'>Time Zone spec:</td><td><input name='tz' type='text' value='%s' size='32' maxlength='32'></td></tr>\n"
@@ -1459,7 +1572,7 @@ wshandleConfig(void)
 		  "<tr><td width='30%%'>RO Community:</td><td><input name='snmpro' type='text' value='%s' size='32' maxlength='63'></td></tr>\n"
 		  "<tr><td width='30%%'>RW Community:</td><td><input name='snmprw' type='text' value='%s' size='32' maxlength='63'></td></tr>\n"
 		  "</table><p>\n",
-		  conf.hostname, conf.hostname, conf.hostname, conf.ssid, conf.wpakey, conf.ntpserver, conf.timezone, conf.quota, conf.perFeed,
+		  conf.hostname, conf.hostname, conf.hostname, conf.ssid, conf.wpakey, conf.BLEtimeout, conf.ntpserver, conf.timezone, conf.quota, conf.perFeed,
 		  conf.flags & CFG_DISPENSE_CLOSED ? "checked" : "", conf.cooloff,
 		  conf.flags & CFG_NTFY_ENABLE ? "checked" : "", 
 		  conf.flags & CFG_NTFY_PROBLEM ? "checked" : "", 
@@ -1500,28 +1613,39 @@ wshandleConfig(void)
 	  conf.flags & CFG_ENGINEERING ? "<p><a href='/engineering'>Engineering options</a></p>" : ""
 	  );
 	strcat(body, temp);
+	free(temp);
 	webserver.send(200, "text/html", body);
 	free(body);
-	free(temp);
 }
 
 void
 wshandleSave(void)
 {
 	char	*temp, hostname[28];
+	int		 wifiChanged = 0;
 	String	 value;
 
 	if ((temp = (char *)malloc(400)) == NULL)
 		return;
 	if (webserver.hasArg("ssid")) {
 		value = webserver.arg("ssid");
-		strncpy(conf.ssid, value.c_str(), 63);
+		if (strncmp(value.c_str(), conf.ssid, 63)) {
+			strncpy(conf.ssid, value.c_str(), 63);
+			wifiChanged = 1;
+		}
 	}
 
 	if (webserver.hasArg("key")) {
 		value = webserver.arg("key");
-		strncpy(conf.wpakey, value.c_str(), 63);
+		if (strncmp(value.c_str(), conf.wpakey, 63)) {
+			strncpy(conf.wpakey, value.c_str(), 63);
+			wifiChanged = 1;
+		}
 	}
+
+	value = webserver.arg("ble");
+	if (value.length() && value.toInt() >= 0 && value.toInt() <= 255)
+		conf.BLEtimeout = value.toInt();
 
 	if (webserver.hasArg("name")) {
 		value = webserver.arg("name");
@@ -1654,7 +1778,7 @@ wshandleSave(void)
 
 	snprintf(hostname, 28, "Feeder-%s", conf.hostname);
 	WiFi.hostname(hostname);
-	if (*conf.ssid && *conf.wpakey)
+	if (wifiChanged && *conf.ssid && *conf.wpakey)
 		WiFi.begin(conf.ssid, conf.wpakey);
 	MDNS.setInstanceName(hostname);
 	configTzTime(conf.timezone, conf.ntpserver);

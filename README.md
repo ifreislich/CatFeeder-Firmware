@@ -12,9 +12,10 @@ Open the project in Platform.io to build.
 - 10 individually configurable dispensing schedules.
 - RFID access control to food and intruder lockout.
 - Web interface for configuration.
-- Push notifications using [ntfy.sh](https://ntfy.sh) using either the free or self-hosted service.
-  - Visitation
-  - Intruder alerts
-  - Dispensing weighed kibbles
-  - Dispensing issues
+- Push notifications using [ntfy.sh](https://ntfy.sh) wsupporting either the free or self-hosted service.
+  - Visitation.
+  - Intruder alerts.
+  - Dispensing weighed kibbles.
+  - Dispensing issues.
+  - Rescue menu on USB or BLE UART.
 - SNMP agent for monitoring.
