@@ -17,5 +17,5 @@ Open the project in Platform.io to build.
   - Intruder alerts.
   - Dispensing weighed kibbles.
   - Dispensing issues.
-  - Rescue menu on USB or BLE UART.
+- Rescue menu on USB or BLE UART.
 - SNMP agent for monitoring.
