@@ -225,6 +225,7 @@ void wshandleSaveSSL(void);
 
 int checkCard(uint8_t, uint16_t);
 const char *catName(uint8_t, uint16_t);
+const char *getResetReason(void);
 int comparSchedule(const void *, const void *);
 float weigh(bool);
 int snmpGetWeight(void);
@@ -311,6 +312,7 @@ setup()
 
 	Serial.begin(115200);
 	debug(false, "ESP chip: %s, %d Cores", ESP.getChipModel(), ESP.getChipCores());
+	debug(false, "Reboot reason: %s", getResetReason());
 	if (fram.begin(0x50) == FRAM_OK) {
 		debug(false, "FRAM present");
 		haveFRAM = 1;
@@ -514,7 +516,7 @@ setup()
 	attachInterrupt(PIN_DATA1, ISR_D1, FALLING);
 	attachInterrupt(PIN_RTC_INTR, ISR_RTC, FALLING);
 	debug(true, "Ready");
-	ntfy(WiFi.getHostname(), "facepalm", 3, "Boot up\\nFirmware: %s %s", __DATE__, __TIME__);
+	ntfy(WiFi.getHostname(), "facepalm", 3, "Reset reason: %s\\nFirmware: %s %s", getResetReason(), __DATE__, __TIME__);
 }
 
 void
@@ -1241,6 +1243,48 @@ getTz(void)
 	tm = gmtime(&t);
 	tz = t - mktime(tm) + (tm->tm_isdst ? 3600 : 0);
 	return(tz);
+}
+
+const char *
+getResetReason(void)
+{
+	const char	*reason;
+	switch (esp_reset_reason()) {
+	  case ESP_RST_UNKNOWN:    //!< Reset reason can not be determined
+		reason = "Unkown";
+		break;
+	  case ESP_RST_POWERON:    //!< Reset due to power-on event
+		reason = "Power-on";
+		break;
+	  case ESP_RST_EXT:        //!< Reset by external pin (not applicable for ESP32)
+		reason = "External reset";
+		break;
+	  case ESP_RST_SW:         //!< Software reset via esp_restart
+		reason = "Software reset";
+		break;
+	  case ESP_RST_PANIC:      //!< Software reset due to exception/panic
+		reason = "Panic";
+		break;
+	  case ESP_RST_INT_WDT:    //!< Reset (software or hardware) due to interrupt watchdog
+		reason = "Interrupt watchdog";
+		break;
+	  case ESP_RST_TASK_WDT:   //!< Reset due to task watchdog
+		reason = "Task watchdog";
+		break;
+	  case ESP_RST_WDT:        //!< Reset due to other watchdogs
+		reason = "Watchdog";
+		break;
+	  case ESP_RST_DEEPSLEEP:  //!< Reset after exiting deep sleep mode
+		reason = "Deep sleep";
+		break;
+	  case ESP_RST_BROWNOUT:   //!< Brownout reset (software or hardware)
+		reason = "Brownout";
+		break;
+	  case ESP_RST_SDIO:       //!< Reset over SDIO
+		reason = "SDIO";
+		break;
+	}
+	return(reason);
 }
 
 int
