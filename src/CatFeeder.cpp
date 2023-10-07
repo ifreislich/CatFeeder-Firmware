@@ -1062,9 +1062,15 @@ void
 loadNvData(void)
 {
 	FastCRC16	 CRC16;
+	uint32_t	 clock;
 
-	if (haveFRAM)
+	if (haveFRAM) {
+		if ((clock = Wire.getClock()) > 0)
+			Wire.setClock(1000000);
 		fram.read(sizeof(conf), (uint8_t *)&nvdata, sizeof(nvdata));
+		if (clock > 0)
+			Wire.setClock(clock);
+	}
 	if (nvdata.magic != MAGIC || nvdata.crc != CRC16.ccitt((uint8_t *)&nvdata, sizeof(struct nvdata) - 2)) {
 		debug(false, "Resetting persistent records");
 		nvdata.dispensedTotal = 0;
@@ -1079,10 +1085,15 @@ void
 saveNvData(void)
 {
 	FastCRC16	 CRC16;
+	uint32_t	 clock;
 
 	if (haveFRAM) {
+		if ((clock = Wire.getClock()) > 0)
+			Wire.setClock(1000000);
 		nvdata.crc = CRC16.ccitt((uint8_t *)&nvdata, sizeof(nvdata) - 2);
 		fram.write(sizeof(conf), (uint8_t *)&nvdata, sizeof(nvdata));
+		if (clock > 0)
+			Wire.setClock(clock);
 	}
 }
 
@@ -1090,10 +1101,16 @@ void
 saveSettings(void)
 {
 	FastCRC16	 CRC16;
+	uint32_t	 clock;
 
 	conf.crc = CRC16.ccitt((uint8_t *)&conf, sizeof(cfg) - 2);
-	if (haveFRAM)
+	if (haveFRAM) {
+		if ((clock = Wire.getClock()) > 0)
+			Wire.setClock(1000000);
 		fram.write(0, (uint8_t *)&conf, sizeof(conf));
+		if (clock > 0)
+			Wire.setClock(clock);
+	}
 	else {
 		unsigned char  *p;
 		p = reinterpret_cast<unsigned char *>(&conf);
@@ -1132,9 +1149,17 @@ void
 configInit(void)
 {
 	FastCRC16	 CRC16;
+	uint32_t	 clock;
 
-	if (haveFRAM)
+	clock = Wire.getClock();
+
+	if (haveFRAM) {
+		if ((clock = Wire.getClock()) > 0)
+			Wire.setClock(1000000);
 		fram.read(0, (uint8_t *)&conf, sizeof(conf));
+		if (clock > 0)
+			Wire.setClock(clock);
+	}
 	else {
 		unsigned char  *p;
 
