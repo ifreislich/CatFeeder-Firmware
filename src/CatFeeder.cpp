@@ -1040,7 +1040,7 @@ wifiEvent(WiFiEvent_t event)
 {
 	switch (event) {
 	case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-		debug(true, "WiFi IP address %s", WiFi.localIP().toString());
+		debug(true, "WiFi IP address %s", WiFi.localIP().toString().c_str());
 		nvdata.state |= STATE_GOT_IP_ADDR;
 		break;
 	case ARDUINO_EVENT_WIFI_STA_CONNECTED:
@@ -1137,6 +1137,7 @@ defaultSettings(void)
 	flags = conf.flags & (CFG_HX711_FAST | CFG_HX711_GAIN_HIGH | CFG_DOOR_MOTOR_SLOW | CFG_ENGINEERING);
 	memset(&conf.hostname, '\0', sizeof(struct cfg) - (offsetof(struct cfg, hostname) - offsetof(struct cfg, magic)));
 	conf.flags = flags;
+	conf.BLEtimeout = 3;
 	WiFi.macAddress(mac);
 	snprintf(conf.hostname, 32, "%02X%02X%02X", mac[3], mac[4], mac[5]);
 	strcpy(conf.cacrt, ca_pem_start);
