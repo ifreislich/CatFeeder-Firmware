@@ -1154,8 +1154,6 @@ configInit(void)
 	FastCRC16	 CRC16;
 	uint32_t	 clock;
 
-	clock = Wire.getClock();
-
 	if (haveFRAM) {
 		if ((clock = Wire.getClock()) > 0)
 			Wire.setClock(1000000);
