@@ -7,7 +7,7 @@ and
 
 ![CatFeeder-Firmware](https://github.com/ifreislich/CatFeeder-Firmware/blob/master/images/root.png)
 
-1. Download dygraph.min.js and dygraph.css from [dygraph.com](https://dygraph.com/) and place them in src.
+1. Download dygraph.min.js and dygraph.css from [dygraphs.com](https://dygraphs.com/) and place them in src.
 2. Open the project in Platform.io to build.
 
 ## Features
