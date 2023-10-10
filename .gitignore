@@ -1,6 +1,4 @@
 .pio
 .vscode
-lib/AccelStepper/
-lib/FastCRC/
-lib/HX711/
-src/ca.pem
+src/dygraph.css
+src/dygraph.min.js

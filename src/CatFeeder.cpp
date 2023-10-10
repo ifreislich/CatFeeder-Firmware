@@ -101,6 +101,17 @@ struct nvdata {
 	uint16_t	crc;
 } __attribute__((__packed__));
 
+#define HISTORY_NDAYS	365
+struct nvhistory {
+	uint32_t	magic;
+	struct {
+		float	dispensed;
+		float	start;
+		float	end;
+	} day[HISTORY_NDAYS];
+	uint16_t	crc;
+} __attribute__((__packed__));
+
 // 32 Bits, Bitmap Configuration Flags
 #define CFG_NTFY_ENABLE		0x0001
 #define CFG_DISPENSE_CLOSED	0x0002
@@ -169,8 +180,18 @@ struct nvdata {
 #define STATE_BLE_CONNECTED	0x00008000
 #define STATE_BLE_DATA		0x00010000
 
+#define OFFSET_CONFIG		0
+#define OFFSET_NVDATA		OFFSET_CONFIG + sizeof(struct cfg)
+#define OFFSET_NVHISTORY	(32767 - sizeof(struct nvhistory))
+
 extern const char ca_pem_start[] asm("_binary_src_ca_pem_start");
 extern const char ca_pem_end[] asm("_binary_src_ca_pem_end");
+extern const char graph_start[] asm("_binary_src_dygraph_min_js_start");
+extern const char graph_end[] asm("_binary_src_dygraph_min_js_end");
+extern const char css_start[] asm("_binary_src_dygraph_css_start");
+extern const char css_end[] asm("_binary_src_dygraph_css_end");
+extern const char favicon_start[] asm("_binary_src_favicon_ico_start");
+extern const char favicon_end[] asm("_binary_src_favicon_ico_end");
 
 volatile uint64_t		databits;              // stores all of the data bits
 volatile unsigned char	bitCount;              // number of bits currently captured
@@ -179,6 +200,7 @@ time_t					 closeTime = 0, lastAuth = 0, bootTime;
 int						 haveFRAM = 0;
 volatile struct nvdata	 nvdata;
 struct cfg				 conf;
+struct nvhistory		 history;
 hw_timer_t				*timer;
 
 NimBLEServer			*pServer = NULL;
@@ -222,6 +244,10 @@ void wshandleEngineering(void);
 void wshandleDoEngineering(void);
 void wshandleSSL(void);
 void wshandleSaveSSL(void);
+void wshandleDygraphJS(void);
+void wshandleDygraphCSS(void);
+void wshandleGraphData(void);
+void wshandleFavIcon(void);
 
 int checkCard(uint8_t, uint16_t);
 const char *catName(uint8_t, uint16_t);
@@ -231,13 +257,13 @@ float weigh(bool);
 int snmpGetWeight(void);
 int snmpGetTemp(void);
 int snmpGetUptime(void);
-void debug(byte, const char *, ...);
+void debug(bool, const char *, ...);
 void ntpCallBack(struct timeval *);
 void wifiEvent(WiFiEvent_t);
 float dispense(int);
 void defaultSettings(void);
 void saveSettings(void);
-void configInit(void);
+void initConfig(void);
 void closeDoor(void);
 void openDoor(void);
 void shutdownDoor(void);
@@ -245,7 +271,9 @@ void shutdownAuger(void);
 void enableDoor(void);
 void enableAuger(void);
 void saveNvData(void);
-void loadNvData(void);
+void initNvData(void);
+void saveNvHistory(void);
+void initNvHistory(void);
 uint8_t getNextAlarm(void);
 uint8_t getCurrentAlarm(void);
 void setAlarm(uint8_t);
@@ -326,10 +354,9 @@ setup()
 		debug(false, "i2c clock=400kHz");
 	else
 		debug(false, "i2c clock=100kHz");
-	configInit();
-	loadNvData();
-	nvdata.state |= STATE_MENU_SELECT;
-	nvdata.state &= ~(STATE_GOT_TIME | STATE_RTC_PRESENT | STATE_WEIGAND_DONE | STATE_GOT_IP_ADDR | STATE_BOOTUP_NTFY | STATE_BLE_CONNECTED);
+	initConfig();
+	initNvData();
+	initNvHistory();
 	if (rtc.begin()) {
 		debug(false, "RTC present");
 		nvdata.state |= STATE_RTC_PRESENT;
@@ -507,6 +534,10 @@ setup()
 	webserver.on("/schedulesave", wshandleScheduleSave);
 	webserver.on("/ssl", wshandleSSL);
 	webserver.on("/sslsave", wshandleSaveSSL);
+	webserver.on("/dygraph.min.js", wshandleDygraphJS);
+	webserver.on("/dygraph.css", wshandleDygraphCSS);
+	webserver.on("/data.txt", wshandleGraphData);
+	webserver.on("/favicon.ico", wshandleFavIcon);
 	webserver.onNotFound(wshandle404);
 	webserver.begin();
 	ArduinoOTA.begin();
@@ -753,6 +784,15 @@ loop()
 		if (rtc.alarmFired(2)) {
 			debug(true, "RTC Alarm 2");
 			rtc.clearAlarm(2);
+			history.day[0].end = weigh(true);
+			history.day[0].dispensed = nvdata.dispensedTotal;
+			for (int i = HISTORY_NDAYS - 1; i > 0; i--) {
+				history.day[i].dispensed = history.day[i-1].dispensed;
+				history.day[i].start = history.day[i-1].start;
+				history.day[i].end = history.day[i-1].end;
+			}
+			history.day[0].start = weigh(true);
+			saveNvHistory();
 			nvdata.dispensedTotal = 0;
 			debug(true, "Reset dispensed total");
 		}
@@ -1061,7 +1101,7 @@ wifiEvent(WiFiEvent_t event)
 }
 
 void
-loadNvData(void)
+initNvHistory(void)
 {
 	FastCRC16	 CRC16;
 	uint32_t	 clock;
@@ -1069,7 +1109,45 @@ loadNvData(void)
 	if (haveFRAM) {
 		if ((clock = Wire.getClock()) > 0)
 			Wire.setClock(1000000);
-		fram.read(sizeof(conf), (uint8_t *)&nvdata, sizeof(nvdata));
+		fram.read(OFFSET_NVHISTORY, (uint8_t *)&history, sizeof(struct nvhistory));
+		if (clock > 0)
+			Wire.setClock(clock);
+	}
+	if (history.magic != MAGIC || history.crc != CRC16.ccitt((uint8_t *)&history, sizeof(struct nvhistory) - 2)) {
+		debug(false, "Resetting history");
+		memset(&history, '\0', sizeof(struct nvhistory));
+		history.magic = MAGIC;
+		history.crc = CRC16.ccitt((uint8_t *)&history, sizeof(struct nvhistory) - 2);
+		saveNvHistory();
+	}
+}
+
+void
+saveNvHistory(void)
+{
+	FastCRC16	 CRC16;
+	uint32_t	 clock;
+
+	if (haveFRAM) {
+		if ((clock = Wire.getClock()) > 0)
+			Wire.setClock(1000000);
+		history.crc = CRC16.ccitt((uint8_t *)&history, sizeof(struct nvhistory) - 2);
+		fram.write(OFFSET_NVHISTORY, (uint8_t *)&history, sizeof(struct nvhistory));
+		if (clock > 0)
+			Wire.setClock(clock);
+	}
+}
+
+void
+initNvData(void)
+{
+	FastCRC16	 CRC16;
+	uint32_t	 clock;
+
+	if (haveFRAM) {
+		if ((clock = Wire.getClock()) > 0)
+			Wire.setClock(1000000);
+		fram.read(OFFSET_NVDATA, (uint8_t *)&nvdata, sizeof(nvdata));
 		if (clock > 0)
 			Wire.setClock(clock);
 	}
@@ -1081,6 +1159,11 @@ loadNvData(void)
 		nvdata.magic = MAGIC;
 		saveNvData();
 	}
+	// Clear states that shouldn't really be kept between boots
+	// TODO: Split out non-NV states so we don't have to bother with this.
+	nvdata.state |= STATE_MENU_SELECT;
+	nvdata.state &= ~(STATE_GOT_TIME | STATE_RTC_PRESENT | STATE_WEIGAND_DONE | STATE_GOT_IP_ADDR |
+	  STATE_BOOTUP_NTFY | STATE_BLE_CONNECTED | STATE_BLE_DATA);
 }
 
 void
@@ -1093,7 +1176,7 @@ saveNvData(void)
 		if ((clock = Wire.getClock()) > 0)
 			Wire.setClock(1000000);
 		nvdata.crc = CRC16.ccitt((uint8_t *)&nvdata, sizeof(nvdata) - 2);
-		fram.write(sizeof(conf), (uint8_t *)&nvdata, sizeof(nvdata));
+		fram.write(OFFSET_NVDATA, (uint8_t *)&nvdata, sizeof(nvdata));
 		if (clock > 0)
 			Wire.setClock(clock);
 	}
@@ -1109,7 +1192,7 @@ saveSettings(void)
 	if (haveFRAM) {
 		if ((clock = Wire.getClock()) > 0)
 			Wire.setClock(1000000);
-		fram.write(0, (uint8_t *)&conf, sizeof(conf));
+		fram.write(OFFSET_CONFIG, (uint8_t *)&conf, sizeof(conf));
 		if (clock > 0)
 			Wire.setClock(clock);
 	}
@@ -1117,7 +1200,7 @@ saveSettings(void)
 		unsigned char  *p;
 		p = reinterpret_cast<unsigned char *>(&conf);
 		for (uint16_t i = 0; i < sizeof(struct cfg); i++)
-			EEPROM.write(i, *p++);
+			EEPROM.write(OFFSET_CONFIG + i, *p++);
 		EEPROM.commit();
 	}
 }
@@ -1149,7 +1232,7 @@ defaultSettings(void)
 }
 
 void
-configInit(void)
+initConfig(void)
 {
 	FastCRC16	 CRC16;
 	uint32_t	 clock;
@@ -1157,7 +1240,7 @@ configInit(void)
 	if (haveFRAM) {
 		if ((clock = Wire.getClock()) > 0)
 			Wire.setClock(1000000);
-		fram.read(0, (uint8_t *)&conf, sizeof(conf));
+		fram.read(OFFSET_CONFIG, (uint8_t *)&conf, sizeof(conf));
 		if (clock > 0)
 			Wire.setClock(clock);
 	}
@@ -1166,7 +1249,7 @@ configInit(void)
 
 		p = reinterpret_cast<unsigned char *>(&conf);
 		for (uint16_t i = 0; i < sizeof(struct cfg); i++)
-			*p++ = EEPROM.read(i);
+			*p++ = EEPROM.read(OFFSET_CONFIG + i);
 	}
 	if (conf.magic != MAGIC || conf.crc != CRC16.ccitt((uint8_t *)&conf, sizeof(struct cfg) - 2)) {
 		debug(true, "Settings corrupted, defaulting");
@@ -1293,28 +1376,29 @@ comparSchedule(const void *a, const void *b)
 }
 
 void
-debug(byte logtime, const char *format, ...)
+debug(bool logtime, const char *format, ...)
 {
 	va_list    pvar;
-	char       str[128];
-	char       timestr[20];
+	static char       str[128];
+	static char       timestr[20];
 	time_t     t = time(NULL);
 	struct tm *tm = localtime(&t);
 	
-	va_start(pvar, format);
 	if (logtime && nvdata.state & STATE_GOT_TIME) {
 		strftime(timestr, 20, "%F %T", tm);
 		Serial.print(timestr);
 		Serial.print(": "); 
 	}
+	va_start(pvar, format);
 	vsnprintf(str, 125, format, pvar);
+	va_end(pvar);
 	Serial.println(str);
+	Serial.flush();
 	if (nvdata.state & STATE_BLE_CONNECTED) {
 		strcat(str, "\r\n");
 		pTxCharacteristic->setValue((uint8_t *)str, strlen(str));
 		pTxCharacteristic->notify();
 	}
-	va_end(pvar);
 }
 
 // tags: https://docs.ntfy.sh/emojis/
@@ -1419,11 +1503,16 @@ wshandleRoot(void) {
 		alarm1.toString(alarm1Date);
 	}
 	snprintf(body, 2048,
-	  "<html>"
+	  "<!doctype html>"
+	  "<html lang='en'>"
 	  "<head>"
-	  "<meta http-equiv='refresh' content='20'/>"
+	  "<meta charset='UTF-8'>"
 	  "<title>Feeder [%s]</title>"
-	  "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>"
+	  "<script src='dygraph.min.js'></script>"
+	  "<link rel='stylesheet' type='text/css' href='dygraph.css'>"
+	  "<style>"
+	    "body {background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088;}"
+		".dygraph-legend {text-align: right;background: none;}</style>"
 	  "</head>"
 	  "<body>"
 	  "<h1>Feeder %s</h1>"
@@ -1434,15 +1523,21 @@ wshandleRoot(void) {
 	  "<p>Dispensed: %3.0f of %3d g</p>"
 	  "<p><a href='/config'>System Configuration</a></p>"
 	  "<p><a href='/schedule'>Feed Dispensing Schedule</a></p>"
-	  "<form method='post' action='/feed' name='Feed'>\n"
-		"<label for='weight'>Dispense grams:</label><input name='weight' type='number' size='3' value='%d' min='1' max='25'>\n"
-		"<input name='Feed' type='submit' value='Feed'>\n"
+	  "<form method='post' action='/feed' name='Feed'>"
+		"Dispense grams:&nbsp;<input name='weight' type='number' size='4' value='%d' min='1' max='25'>"
+		"<input name='Feed' type='submit' value='Feed'>"
 	  "</form>"
+	  "<div id='history' style='width:600px; height:300px;'></div>"
 	  "<p><font size=1>"
-	  "<a href='/tare'>Zero the scale</a></br>"
+	  "<a href='/tare'>Zero the scale</a><br>"
 	  "Uptime: %d days %02d:%02d:%02d<br>"
 	  "Firmware: " __DATE__ " " __TIME__ "<br>"
-	  "</font>\n"
+	  "</font>"
+	  "<script>Dygraph.onDOMready(function onDOMready() {"
+		"new Dygraph(document.getElementById('history'), 'data.txt', "
+		"{title: 'Feeding history', legend: 'always', ylabel: 'Weight', showRangeSelector: true});"
+	  "});"
+	  "</script>"
 	  "</body>"
 	  "</html>",
 	  conf.hostname, conf.hostname,
@@ -1456,6 +1551,7 @@ wshandleRoot(void) {
 	webserver.send(200, "text/html", body);
 	free(body);
 }
+		//"{title: 'Feeding history', ylabel: 'Temperature (F)', showRangeSelector: true});"
 
 void
 wshandleEngineering(void) {
@@ -1466,6 +1562,7 @@ wshandleEngineering(void) {
 		return;
 	}
 	snprintf(body, 2048,
+	  "<!doctype html>"
 	  "<html>"
 	  "<head>"
 	  "<title>Feeder [%s]</title>"
@@ -1515,6 +1612,7 @@ wshandleSSL()
 	}
 	// 437 excluding certificate text
 	snprintf(body, MAX_CERT+450,
+	  "<!doctype html>"
 	  "<html>"
 	  "<head>"
 	  "<title>Feeder [%s]</title>"
@@ -1540,8 +1638,12 @@ wshandleReboot()
 {
 	char	*body;
 
-	body = (char *)malloc(400);
+	if ((body = (char *)malloc(400)) == NULL) {
+		debug(true, "WEB / failed to allocate memory");
+		return;
+	}
 	snprintf(body, 400,
+	  "<!doctype html>"
 	  "<html>\n"
 	  "<head>\n"
 	  "<title>Feeder [%s]</title>\n"
@@ -1562,7 +1664,8 @@ wshandleReboot()
 }
 
 void 
-wshandle404(void) {
+wshandle404(void)
+{
 	String	 message = "File Not Found\n\n";
 
 	message += "URI: ";
@@ -1578,6 +1681,56 @@ wshandle404(void) {
 	}
 
 	webserver.send(404, "text/plain", message);
+}
+
+void
+wshandleFavIcon(void)
+{
+	webserver.send_P(200, "image/x-icon", favicon_start, favicon_end - favicon_start);
+}
+
+void
+wshandleDygraphJS(void)
+{
+	webserver.send_P(200, "application/javascript", graph_start);
+}
+
+void
+wshandleDygraphCSS(void)
+{
+	webserver.send_P(200, "text/css", css_start);
+}
+
+void
+wshandleGraphData(void)
+{
+	char	*body, *p;
+	char	 timestr[13];
+	int		 i, len;
+	time_t	 td, t = time(NULL);
+	struct tm	*tm;
+
+	if ((body = (char *)malloc(8800)) == NULL) {
+		debug(true, "WEB / failed to allocate 8800 bytes");
+		return;
+	}
+
+	p = body;
+	len = sprintf(p, "%s, %4s\n", "Date", "Weight");
+	p += len;
+	for (i = HISTORY_NDAYS - 1 ; i >= 0; i--) {
+		td = t - i * 86400;
+		tm = localtime(&td);
+		strftime(timestr, 20, "%F", tm);
+
+		len = sprintf(p, "%s, %5.1f\n", timestr,
+		  history.day[i].start + (i == 0 ? nvdata.dispensedTotal : history.day[i].dispensed) -
+		  (i == 0 ? weigh(true) : history.day[i].end));
+		p += len;
+	}
+
+	webserver.send_P(200, "text/plain", body);
+	free(body);
 }
 
 void
@@ -1598,6 +1751,7 @@ wshandleConfig(void)
 	
 	// max 3662 characters.
 	snprintf(body, 3670,
+		"<!doctype html>"
 		"<html>\n"
 		"<head>\n"
 		"<title>Feeder [%s]</title>\n"
@@ -1682,7 +1836,7 @@ wshandleConfig(void)
 	  );
 	strcat(body, temp);
 	free(temp);
-	webserver.send(200, "text/html", body);
+	webserver.send_P(200, "text/html", body);
 	free(body);
 }
 
