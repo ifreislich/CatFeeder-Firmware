@@ -1719,6 +1719,8 @@ wshandleGraphData(void)
 	len = sprintf(p, "%s, %4s\n", "Date", "Weight");
 	p += len;
 	for (i = HISTORY_NDAYS - 1 ; i >= 0; i--) {
+		if (i && history.day[i].start == 0 && history.day[i].dispensed == 0 && history.day[i].end == 0)
+			continue;
 		td = t - i * 86400;
 		tm = localtime(&td);
 		strftime(timestr, 20, "%F", tm);
