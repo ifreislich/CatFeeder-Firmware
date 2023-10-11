@@ -1510,6 +1510,7 @@ wshandleRoot(void) {
 	  "<title>Feeder [%s]</title>"
 	  "<script src='dygraph.min.js'></script>"
 	  "<link rel='stylesheet' type='text/css' href='dygraph.css'>"
+	"<link rel='icon' type='image/x-icon' href='/favicon.ico'>"
 	  "<style>"
 	    "body {background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088;}"
 		".dygraph-legend {text-align: right;background: none;}</style>"
@@ -1563,9 +1564,10 @@ wshandleEngineering(void) {
 	}
 	snprintf(body, 2048,
 	  "<!doctype html>"
-	  "<html>"
+	  "<html lang='en'>"
 	  "<head>"
 	  "<title>Feeder [%s]</title>"
+	  "<link rel='icon' type='image/x-icon' href='/favicon.ico'>"
 	  "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>"
 	  "</head>"
 	  "<body>"
@@ -1580,7 +1582,7 @@ wshandleEngineering(void) {
 	  "<tr><td width='40%%'>Door stepper slow timing:</td><td><input name='door12v' type='checkbox' value='true' %s></td></tr>"
 	  "<tr><td width='40%%'>Scale offset:</td><td><input name='offset' type='number' value='%ld'></td></tr>"
 	  "<tr><td width='40%%'>Scale factor:</td><td><input name='factor' type='number' value='%f'></td></tr>"
-	  "<tr><td width='40%%'>Dispensed total:</td><td><input name='weight' type='number' value='%5.2f' min='0' max='100' step='0.01'></td></tr>"
+	  "<tr><td width='40%%'>Dispensed total:</td><td><input name='weight' type='number' value='%.2f' min='0' max='100' step='0.01'></td></tr>"
 	  "</table>"
 	  "<input name='Save' type='submit' value='Save'>\n"
 	  "</form>"
@@ -1613,9 +1615,10 @@ wshandleSSL()
 	// 437 excluding certificate text
 	snprintf(body, MAX_CERT+450,
 	  "<!doctype html>"
-	  "<html>"
+	  "<html lang='en'>"
 	  "<head>"
 	  "<title>Feeder [%s]</title>"
+	  "<link rel='icon' type='image/x-icon' href='/favicon.ico'>"
 	  "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>"
 	  "</head>"
 	  "<body>"
@@ -1644,9 +1647,10 @@ wshandleReboot()
 	}
 	snprintf(body, 400,
 	  "<!doctype html>"
-	  "<html>\n"
+	  "<html lang='en'>\n"
 	  "<head>\n"
 	  "<title>Feeder [%s]</title>\n"
+	  "<link rel='icon' type='image/x-icon' href='/favicon.ico'>"
 	  "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
 	  "</head>\n"
 	  "<body>\n"
@@ -1754,9 +1758,10 @@ wshandleConfig(void)
 	// max 3662 characters.
 	snprintf(body, 3670,
 		"<!doctype html>"
-		"<html>\n"
+		"<html lang='en'>\n"
 		"<head>\n"
 		"<title>Feeder [%s]</title>\n"
+		"<link rel='icon' type='image/x-icon' href='/favicon.ico'>"
 		"<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
 		"</head>\n"
 		"<body>\n"
@@ -1771,12 +1776,12 @@ wshandleConfig(void)
 		  "<tr><td width='30%%'>NTP Server:</td><td><input name='ntp' type='text' value='%s' size='32' maxlength='63' "
 			"pattern='^([a-z0-9]+)(\\.)([_a-z0-9]+)((\\.)([_a-z0-9]+))?$' title='A valid hostname'></td></tr>\n"
 		  "<tr><td width='30%%'>Time Zone spec:</td><td><input name='tz' type='text' value='%s' size='32' maxlength='32'></td></tr>\n"
-		  "<tr><td>&nbsp</td><td>&nbsp</td></tr>"
+		  "<tr><td>&nbsp;</td><td>&nbsp;</td></tr>"
 		  "<tr><td width='30%%'>Daily quota:</td><td><input name='quota' type='number' size='4' value='%d' min='10' max='120'>grams</td></tr>\n"
 		  "<tr><td width='30%%'>Per feed:</td><td><input name='perfeed' type='number' size='4' value='%d' min='1' max='25'>grams</td></tr>\n"
 		  "<tr><td width='30%%'>Close to feed:</td><td><input name='ctf' type='checkbox' value='true' %s></td></tr>\n"
 		  "<tr><td width='30%%'>Feed cooloff:</td><td><input name='cooloff' type='number' size='4' value='%d' min='0' max='120'> Minutes</td></tr>\n"
-		  "<tr><td>&nbsp</td><td>&nbsp</td></tr>"
+		  "<tr><td>&nbs;p</td><td>&nbsp;</td></tr>"
 		  "<tr><td width='30%%'>Notifications:</td><td><input name='ntfy' type='checkbox' value='true' %s></td></tr>\n"
 		  "<tr><td width='30%%'>Events:</td><td>"
 			"<table border=0 cellspacing=0 cellpadding=0>\n"
@@ -1787,11 +1792,11 @@ wshandleConfig(void)
 			"</table>"
 		  	"</td></tr>\n"
 		  "<tr><td width='30%%'>Service URL:</td><td><input name='url' type='url' value='%s' size='32' maxlength='63'></td></tr>\n"
-		  "<tr><td width='30%%'>Topic:</ltd><td><input name='topic' type='text' value='%s' size='32' maxlength='63'></td></tr>\n"
+		  "<tr><td width='30%%'>Topic:</td><td><input name='topic' type='text' value='%s' size='32' maxlength='63'></td></tr>\n"
 		  "<tr><td width='30%%'>NTFY login:</td><td><input name='ntfy-auth' type='checkbox' value='true' %s></td></tr>\n"
 		  "<tr><td width='30%%'>Username:</td><td><input name='user' type='text' value='%s' size='15' maxlength='15'></td></tr>\n"
 		  "<tr><td width='30%%'>Password:</td><td><input name='passwd' type='text' value='%s' size='15' maxlength='15'></td></tr>\n"
-		  "<tr><td>&nbsp</td><td>&nbsp</td></tr>"
+		  "<tr><td>&nbsp;</td><td>&nbsp;</td></tr>"
 		  "<tr><td width='30%%'>SNMP:</td><td><input name='snmp' type='checkbox' value='true' %s></td></tr>\n"
 		  "<tr><td width='30%%'>RO Community:</td><td><input name='snmpro' type='text' value='%s' size='32' maxlength='63'></td></tr>\n"
 		  "<tr><td width='30%%'>RW Community:</td><td><input name='snmprw' type='text' value='%s' size='32' maxlength='63'></td></tr>\n"
@@ -2008,9 +2013,11 @@ wshandleSave(void)
 	configTzTime(conf.timezone, conf.ntpserver);
 	
 	snprintf(temp, 400,
-	  "<html>\n"
+	  "<!doctype html>"
+	  "<html lang='en'>\n"
 	  "<head>\n"
 	  "<title>Feeder [%s]</title>\n"
+	  "<link rel='icon' type='image/x-icon' href='/favicon.ico'>"
 	  "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
 	  "</head>\n"
 	  "<body>\n"
@@ -2041,9 +2048,11 @@ wshandleSaveSSL()
 	}
 
 	snprintf(body, 400,
-	  "<html>\n"
+	  "<!doctype html>"
+	  "<html lang='en'>\n"
 	  "<head>\n"
 	  "<title>Feeder [%s]</title>\n"
+	  "<link rel='icon' type='image/x-icon' href='/favicon.ico'>"
 	  "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
 	  "</head>\n"
 	  "<body>\n"
@@ -2072,9 +2081,11 @@ wshandleDoFeed()
 		weight = value.toInt();
 
 	snprintf(body, 400,
-	  "<html>\n"
+	  "<!doctype html>"
+	  "<html lang='en'>\n"
 	  "<head>\n"
 	  "<title>Feeder [%s]</title>\n"
+	  "<link rel='icon' type='image/x-icon' href='/favicon.ico'>"
 	  "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
 	  "</head>\n"
 	  "<body>\n"
@@ -2106,9 +2117,11 @@ wshandleCalibrate(void)
 	scale.set_scale();
 	scale.tare(100);
 	snprintf(body, 540,
-	  "<html>\n"
+	  "<!doctype html>"
+	  "<html lang='en'>\n"
 	  "<head>\n"
 	  "<title>Feeder [%s]</title>\n"
+	  "<link rel='icon' type='image/x-icon' href='/favicon.ico'>"
 	  "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
 	  "</head>\n"
 	  "<body>\n"
@@ -2144,9 +2157,11 @@ wshandleDoCalibrate(void)
 	}
 
 	snprintf(body, 400,
-	  "<html>\n"
+	  "<!doctype html>"
+	  "<html lang='en'>\n"
 	  "<head>\n"
 	  "<title>Feeder [%s]</title>\n"
+	  "<link rel='icon' type='image/x-icon' href='/favicon.ico'>"
 	  "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
 	  "</head>\n"
 	  "<body>\n"
@@ -2172,9 +2187,11 @@ wshandleTare(void)
 	saveSettings();
 	
 	snprintf(body, 400,
-	  "<html>\n"
+	  "<!doctype html>"
+	  "<html lang='en'>\n"
 	  "<head>\n"
 	  "<title>Feeder [%s]</title>\n"
+	  "<link rel='icon' type='image/x-icon' href='/favicon.ico'>"
 	  "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
 	  "</head>\n"
 	  "<body>\n"
@@ -2201,14 +2218,16 @@ wshandleSchedule(void)
 	}
 	
 	snprintf(body, 2000,
-	  "<html>\n"
+	  "<!doctype html>"
+	  "<html lang='en'>\n"
 	  "<head>\n"
 	  "<title>Feeder [%s]</title>\n"
+	  "<link rel='icon' type='image/x-icon' href='/favicon.ico'>"
 	  "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
 	  "</head>\n"
 	  "<body>\n"
 	  "<h1>Feeder %s</h1>"
-	  "<form method='post' action='/schedulesave' name='Schedule'/>\n",
+	  "<form method='post' action='/schedulesave' name='Schedule'>\n",
 	  conf.hostname, conf.hostname);
 
 	//for (int i = 0; i < CFG_NSCHEDULES; i++) {
@@ -2280,9 +2299,11 @@ if ((temp = (char *)malloc(400)) == NULL)
 	}
 
 	snprintf(temp, 400,
-	  "<html>\n"
+	  "<!doctype html>"
+	  "<html lang='en'>\n"
 	  "<head>\n"
 	  "<title>Feeder [%s]</title>\n"
+	  "<link rel='icon' type='image/x-icon' href='/favicon.ico'>"
 	  "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
 	  "</head>\n"
 	  "<body>\n"
@@ -2349,9 +2370,11 @@ wshandleDoEngineering(void)
 	}
 
 	snprintf(body, 400,
-	  "<html>\n"
+	  "<!doctype html>"
+	  "<html lang='en'>\n"
 	  "<head>\n"
 	  "<title>Feeder [%s]</title>\n"
+	  "<link rel='icon' type='image/x-icon' href='/favicon.ico'>"
 	  "<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
 	  "</head>\n"
 	  "<body>\n"
