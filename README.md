@@ -22,4 +22,4 @@ and
   - Dispensing issues.
 - Rescue menu on USB or BLE UART.
 - SNMP agent for monitoring.
-- 365 day feeding history with an interactive graph (uses dygraph).
+- 365 day feeding history with an interactive graph (uses [dygraphs.com](https://dygraphs.com/)).
