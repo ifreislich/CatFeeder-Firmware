@@ -1536,7 +1536,7 @@ wshandleRoot(void) {
 	  "</font>"
 	  "<script>Dygraph.onDOMready(function onDOMready() {"
 		"new Dygraph(document.getElementById('history'), 'data.txt', "
-		"{title: 'Feeding history', legend: 'always', ylabel: 'Weight', showRangeSelector: true});"
+		"{title: 'Feeding history', legend: 'always', ylabel: 'Weight', showRangeSelector: true, includeZero: true});"
 	  "});"
 	  "</script>"
 	  "</body>"
