@@ -1549,6 +1549,7 @@ wshandleRoot(void) {
 	  conf.perFeed,
 	  sec / 86400, hr % 24, min % 60, sec % 60
 	);
+	webserver.sendHeader("cache-control", "no-store", false);
 	webserver.send(200, "text/html", body);
 	free(body);
 }
@@ -1599,6 +1600,7 @@ wshandleEngineering(void) {
 	  nvdata.dispensedTotal,
 	  sizeof(struct cfg)
 	);
+	webserver.sendHeader("cache-control", "no-store", false);
 	webserver.send(200, "text/html", body);
 	free(body);
 }
@@ -1632,6 +1634,7 @@ wshandleSSL()
 	  conf.hostname, conf.hostname, MAX_CERT, conf.cacrt
 	);
 
+	webserver.sendHeader("cache-control", "no-store", false);
 	webserver.send(200, "text/html", body);
 	free(body);
 }
@@ -1660,6 +1663,7 @@ wshandleReboot()
 	  "</body>\n"
 	  "</html>", conf.hostname, conf.hostname);
 	  
+	webserver.sendHeader("cache-control", "no-store", false);
 	webserver.send(200, "text/html", body);
 	free(body);
 	delay(100);
@@ -1684,24 +1688,28 @@ wshandle404(void)
 		message += " " + webserver.argName(i) + ": " + webserver.arg(i) + "\n";
 	}
 
+	webserver.sendHeader("cache-control", "no-store", false);
 	webserver.send(404, "text/plain", message);
 }
 
 void
 wshandleFavIcon(void)
 {
+	webserver.sendHeader("cache-control", "public, max-age=86400", false);
 	webserver.send_P(200, "image/x-icon", favicon_start, favicon_end - favicon_start);
 }
 
 void
 wshandleDygraphJS(void)
 {
+	webserver.sendHeader("cache-control", "public, max-age=86400", false);
 	webserver.send_P(200, "application/javascript", graph_start);
 }
 
 void
 wshandleDygraphCSS(void)
 {
+	webserver.sendHeader("cache-control", "public, max-age=86400", false);
 	webserver.send_P(200, "text/css", css_start);
 }
 
@@ -1735,6 +1743,7 @@ wshandleGraphData(void)
 		p += len;
 	}
 
+	webserver.sendHeader("cache-control", "no-store", false);
 	webserver.send_P(200, "text/plain", body);
 	free(body);
 }
@@ -1843,6 +1852,7 @@ wshandleConfig(void)
 	  );
 	strcat(body, temp);
 	free(temp);
+	webserver.sendHeader("cache-control", "no-store", false);
 	webserver.send_P(200, "text/html", body);
 	free(body);
 }
@@ -2027,6 +2037,7 @@ wshandleSave(void)
 	  "</body>\n"
 	  "</html>", conf.hostname, conf.hostname, webserver.args());
 	  
+	webserver.sendHeader("cache-control", "no-store", false);
 	webserver.send(200, "text/html", temp);
 	free(temp);
 	saveSettings();
@@ -2062,6 +2073,7 @@ wshandleSaveSSL()
 	  "</body>\n"
 	  "</html>", conf.hostname, conf.hostname, webserver.args());
 
+	webserver.sendHeader("cache-control", "no-store", false);
 	webserver.send(200, "text/html", body);
 	free(body);
 	saveSettings();
@@ -2095,6 +2107,7 @@ wshandleDoFeed()
 	  "</body>\n"
 	  "</html>", conf.hostname, conf.hostname, weight);
 	  
+	webserver.sendHeader("cache-control", "no-store", false);
 	webserver.send(200, "text/html", body);
 	free(body);
 	
@@ -2171,6 +2184,7 @@ wshandleDoCalibrate(void)
 	  "</body>\n"
 	  "</html>", conf.hostname, conf.hostname, conf.scale);
 
+	webserver.sendHeader("cache-control", "no-store", false);
 	webserver.send(200, "text/html", body);
 	free(body);
 }
@@ -2201,6 +2215,7 @@ wshandleTare(void)
 	  "</body>\n"
 	  "</html>", conf.hostname, conf.hostname, conf.offset);
 	  
+	webserver.sendHeader("cache-control", "no-store", false);
 	webserver.send(200, "text/html", body);
 	free(body);
 }
@@ -2253,6 +2268,7 @@ wshandleSchedule(void)
 	  "</body>\n"
 	  "</html>");
 
+	webserver.sendHeader("cache-control", "no-store", false);
 	webserver.send(200, "text/html", body);
 	free(body);
 	free(temp);
@@ -2313,6 +2329,7 @@ if ((temp = (char *)malloc(400)) == NULL)
 	  "</body>\n"
 	  "</html>", conf.hostname, conf.hostname, webserver.args());
 
+	webserver.sendHeader("cache-control", "no-store", false);
 	webserver.send(200, "text/html", temp);
 	free(temp);
 
@@ -2384,6 +2401,7 @@ wshandleDoEngineering(void)
 	  "</body>\n"
 	  "</html>", conf.hostname, conf.hostname, webserver.args());
 
+	webserver.sendHeader("cache-control", "no-store", false);
 	webserver.send(200, "text/html", body);
 	free(body);
 	digitalWrite(PIN_HX711_RATE, conf.flags & CFG_HX711_FAST ? 1 : 0); // 0: 10Hz, 1: 80Hz
