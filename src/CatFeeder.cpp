@@ -173,7 +173,7 @@ struct nvhistory {
 #define STATE_NO_SCHEDULE	0x00000040
 #define STATE_SKIP_DISPENSE	0x00000080
 #define STATE_WEIGAND_DONE	0x00000100
-#define STATE_UNUSED_0		0x00000200
+#define STATE_JSON_ERROR	0x00000200
 #define STATE_MENU_SELECT	0x00000400
 #define STATE_MENU_SSID		0x00000800
 #define STATE_MENU_PSK		0x00001000
@@ -283,7 +283,7 @@ void initNvData(void);
 void saveNvHistory(void);
 void initNvHistory(void);
 void configToJson(char **);
-void jsonToConfig(const char *);
+int jsonToConfig(const char *);
 uint8_t getNextAlarm(void);
 uint8_t getCurrentAlarm(void);
 void setAlarm(uint8_t);
@@ -351,6 +351,11 @@ setup()
 	Serial.begin(115200);
 	debug(false, "ESP chip: %s, %d Cores", ESP.getChipModel(), ESP.getChipCores());
 	debug(false, "Reboot reason: %s", getResetReason());
+	Wire.begin();
+	if (Wire.setClock(400000))
+		debug(false, "i2c clock=400kHz");
+	else
+		debug(false, "i2c clock=100kHz");
 	if (fram.begin(0x50) == FRAM_OK) {
 		debug(false, "FRAM present");
 		haveFRAM = 1;
@@ -360,10 +365,6 @@ setup()
 		haveFRAM = 0;
 		EEPROM.begin(8192);
 	}
-	if (Wire.setClock(400000))
-		debug(false, "i2c clock=400kHz");
-	else
-		debug(false, "i2c clock=100kHz");
 	initConfig();
 	initNvData();
 	initNvHistory();
@@ -561,7 +562,6 @@ setup()
 	attachInterrupt(PIN_DATA1, ISR_D1, FALLING);
 	attachInterrupt(PIN_RTC_INTR, ISR_RTC, FALLING);
 	debug(true, "Ready");
-	ntfy(WiFi.getHostname(), "facepalm", 3, "Reset reason: %s\\nFirmware: %s %s", getResetReason(), __DATE__, __TIME__);
 }
 
 void
@@ -744,6 +744,12 @@ loop()
 	  nvdata.state & STATE_GOT_TIME && time(NULL) - bootTime > conf.BLEtimeout * 60) {
 		debug(true, "Disabling BlueTooth");
 		NimBLEDevice::deinit();
+	}
+
+	if (~nvdata.state & STATE_BOOTUP_NTFY && nvdata.state & STATE_GOT_IP_ADDR) {
+		ntfy(WiFi.getHostname(), "facepalm", 3, "Boot up %6.3f seconds ago\\nReset reason: %s\\nFirmware: %s %s",
+			millis() / 1000.0, getResetReason(), __DATE__, __TIME__);
+		nvdata.state |= STATE_BOOTUP_NTFY;
 	}
 
 	if (nvdata.state & STATE_RTC_INTR) {
@@ -1334,7 +1340,7 @@ configToJson(char **sDoc)
 	}
 }
 
-void
+int
 jsonToConfig(const char *sDoc)
 {
 	DynamicJsonDocument		 jdoc(2048 + MAX_CERT);
@@ -1344,7 +1350,7 @@ jsonToConfig(const char *sDoc)
 
 	if ((err = deserializeJson(jdoc, sDoc))) {
 		debug(true, "deserializeJson() failed: %s", err.c_str());
-		return;
+		return(1);
 	}
 
 	if (jdoc.containsKey("cal-factor"))
@@ -1412,6 +1418,7 @@ jsonToConfig(const char *sDoc)
 
 	qsort(conf.schedule, CFG_NSCHEDULES, sizeof(struct schedule), comparSchedule);
 	setAlarm(getNextAlarm());
+	return(0);
 }
 
 uint8_t
@@ -1532,7 +1539,7 @@ void
 debug(bool logtime, const char *format, ...)
 {
 	va_list			 pvar;
-	static char		 str[128];
+	static char		 str[256];
 	static char		 timestr[20];
 	time_t			 t = time(NULL);
 	struct tm		*tm = localtime(&t);
@@ -1543,7 +1550,7 @@ debug(bool logtime, const char *format, ...)
 		Serial.print(": "); 
 	}
 	va_start(pvar, format);
-	vsnprintf(str, 125, format, pvar);
+	vsnprintf(str, 253, format, pvar);
 	va_end(pvar);
 	Serial.println(str);
 	Serial.flush();
@@ -1620,7 +1627,8 @@ ntfy(const char *title, const char *tags, const uint8_t priority, const char *fo
 			debug(true, "HTTP POST Status = %d, content_length = %ld",
 			esp_http_client_get_status_code(client),
 			esp_http_client_get_content_length(client));
-			debug(true, buffer, strlen(buffer));
+			buffer[data_read - 1] = '\0';
+			debug(true, buffer);
 		} else {
 			debug(true, "Failed to read response");
 		}
@@ -1684,7 +1692,6 @@ wshandleRoot(void) {
 	  <p><a href='/schedule'>Feed Dispensing Schedule</a></p>
 	  <p><a href='/maintenance'>Maintenance</a></p>
 	  <p><font size=1>
-	  <a href='/tare'>Zero the scale</a><br>
 	  Uptime: %d days %02d:%02d:%02d<br>
 	  Firmware: %s %s<br>
 	  </font>
@@ -1697,7 +1704,7 @@ wshandleRoot(void) {
 	  </html>)",
 	  conf.hostname, conf.hostname,
 	  timestr,
-	  NimBLEDevice::getInitialized() ? "<p style='color: #AA0000;'>BlueTooth Advertising</p>" : "",
+	  NimBLEDevice::getInitialized() ? "<p style='color: #AA0000;'>Warning: Bluetooth is active</p>" : "",
 	  nvdata.state & STATE_CHECK_HOPPER ? "<p style='color: #AA0000;'>Check Hopper</p>" : "",
 	  ~nvdata.state & STATE_NO_SCHEDULE ? alarm1Date : "No Schedule",
 	  weigh(true), nvdata.dispensedTotal, conf.quota,
@@ -1878,6 +1885,7 @@ wshandleMaintenance(void)
 		debug(true, "WEB / failed to allocate memory");
 		return;
 	}
+	// 958 bytes max
 	snprintf(body, 1024,
 	R"(<!DOCTYPE html>
 	<html lang='en'>
@@ -1890,15 +1898,16 @@ wshandleMaintenance(void)
 	</head>
 	<body>
 	<h1>Feeder %s</h1>
+	<p><a href='/tare'>Zero the scale</a></p>
 	<p><a href='/configuration.json'>Download configuration file</a></p>
 	<p><form method='POST' action='/upload' enctype='multipart/form-data'>
 		Configuration:<br><input type='file' accept='.json' name='configuration'>
 		<input type='submit' value='Restore'>
-	</form>
+	</form></p>
 	<p><form method='POST' action='/fwupdate' enctype='multipart/form-data'>
 		Firmware:<br><input type='file' accept='.bin' name='firmware'>
 		<input type='submit' value='Install'>
-	</form>
+	</form></p>
 	</body>
 	</html>)",
 	conf.hostname, conf.hostname);
@@ -1940,14 +1949,17 @@ wshandleUploadResult(void)
 	"</head>\n"
 	"<body>\n"
 	"<h1>Feeder %s</h1>"
-	"Configuration updated.<br>Check System and schedules.<br>Save to commit."
+	"%s"
 	"<meta http-equiv='Refresh' content='5; url=/'>"
 	"</body>\n"
-	"</html>", conf.hostname, conf.hostname);
+	"</html>", conf.hostname, conf.hostname,
+	nvdata.state & STATE_JSON_ERROR ? "Error reading configuration" : "Configuration updated.<br>Check System and schedules.<br>Save to commit."
+	);
 
 	webserver.sendHeader("cache-control", "no-store", false);
 	webserver.send(200, "text/html", body);
 	free(body);
+	nvdata.state &= ~STATE_JSON_ERROR;
 }
 
 void
@@ -1959,6 +1971,7 @@ wshandleUpload(void)
 	switch (upload.status) {
 	  case UPLOAD_FILE_START:
 		debug(true, "Upload started. Filename: %s", upload.filename.c_str());
+		nvdata.state &= ~STATE_JSON_ERROR;
 		break;
 	  case UPLOAD_FILE_WRITE:
 		if ((data = (char *)realloc(data, upload.currentSize + upload.totalSize + 1)) != NULL) {
@@ -1969,7 +1982,8 @@ wshandleUpload(void)
 		debug(true, "Upload end");
 		if (data) {
 			data[upload.totalSize] = '\0';
-			jsonToConfig(data);
+			if (jsonToConfig(data))
+				nvdata.state |= STATE_JSON_ERROR;
 			free(data);
 			data = NULL;
 		}
@@ -1995,11 +2009,12 @@ wsFirmwareUpdate(void)
 				debug(true, "Update error: %s", Update.errorString());
 			}
 			debug(true, "Firmware Update Start");
+			ntfy(WiFi.getHostname(), "floppy_disk", 3, "Updating: firmware");
 		}
 		break;
 	  case UPLOAD_FILE_WRITE:
-		if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-			debug(true, "Firmware Update error: %s", Update.errorString());
+		if (!Update.hasError() && Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+			debug(true, "Update.write() error: %s", Update.errorString());
 		}
 		break;
 	  case UPLOAD_FILE_END:
@@ -2007,12 +2022,12 @@ wsFirmwareUpdate(void)
 			debug(true, "Firmware Update Done writing");
 		}
 		else {
-			debug(true, "Firmware Update error: %s", Update.errorString());
+			debug(true, "Update.end() error: %s", Update.errorString());
 		}
 		break;
 	  case UPLOAD_FILE_ABORTED:
 		Update.end();
-		debug(true, "Firmware Update was aborted");
+		debug(true, "Firmware upload was aborted");
 		break;
 	}
 }
@@ -2022,20 +2037,39 @@ wsFirmwareUpdateResult(void)
 {
 	char	*body;
 
-	if ((body = (char *)malloc(400)) == NULL) {
+	if ((body = (char *)malloc(600)) == NULL) {
 		debug(true, "WEB / failed to allocate memory");
 		return;
 	}
 
+	snprintf(body, 600,
+		R"(<!doctype html>
+		<html lang='en'>
+		<head>
+		<title>Feeder [%s]</title>
+		<link rel='icon' type='image/x-icon' href='/favicon.ico'>
+		<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>
+		<meta http-equiv='refresh' content='%d; url=/'>
+		</head>
+		<body>
+		<h1>Feeder %s</h1>
+		%s
+		</body>
+		</html>)",
+		conf.hostname,
+		Update.hasError() ? 3 : 15,
+		conf.hostname,
+		Update.hasError() ? "Update failed" : "Update Success! Rebooting...");
+
 	webserver.sendHeader("cache-control", "no-store", false);
+	webserver.client().setNoDelay(true);
+	webserver.send_P(200, PSTR("text/html"), body);
 
 	if (Update.hasError()) {
-		webserver.send(200, F("text/html"), "Update error");
 		free(body);
+		ntfy(WiFi.getHostname(), "warning", 3, "Update error: %s", Update.errorString());
 	}
 	else {
-		webserver.client().setNoDelay(true);
-		webserver.send_P(200, PSTR("text/html"), "<META http-equiv=\"refresh\" content=\"15;URL=/\">Update Success! Rebooting...");
 		delay(100);
 		webserver.client().stop();
 		ESP.restart();
@@ -2082,8 +2116,8 @@ wshandleConfig(void)
 {
 	char	*body, *temp;
 
-	// 8736 characters max body size.
-	if ((body = (char *)malloc(8800)) == NULL) {
+	// 8913 characters max body size.
+	if ((body = (char *)malloc(8996)) == NULL) {
 		debug(true, "WEB / failed to allocate 8800 bytes");
 		return;
 	}
@@ -2093,8 +2127,8 @@ wshandleConfig(void)
 		return;
 	}
 	
-	// max 3662 characters.
-	snprintf(body, 3670,
+	// max 3921 characters.
+	snprintf(body, 3930,
 		"<!doctype html>"
 		"<html lang='en'>\n"
 		"<head>\n"
@@ -2151,7 +2185,7 @@ wshandleConfig(void)
 		  conf.ntfy.username, conf.ntfy.password,
 		  conf.flags & CFG_SNMP_ENABLE ? "checked" : "", conf.snmpro, conf.snmprw);
 
-	// max 681 characters per cat
+	// max 679 characters per cat
 	for (int i = 0; i < CFG_NCATS; i++) {
 		snprintf(temp, 688,
 		  "<table border=0 width='520' cellspacing=4 cellpadding=0>\n"
