@@ -42,8 +42,10 @@
 #include <sys/time.h>
 #include <stdarg.h>
 #include <EEPROM.h>
+#include <ArduinoJson.h>
 #include <esp_http_client.h>
 #include <NimBLEDevice.h>
+#include <Update.h>
 
 #define MAGIC			0xd41d8cd5
 #define CFG_NCATS		7
@@ -193,8 +195,8 @@ extern const char css_end[] asm("_binary_src_dygraph_css_end");
 extern const char favicon_start[] asm("_binary_src_favicon_ico_start");
 extern const char favicon_end[] asm("_binary_src_favicon_ico_end");
 
-volatile uint64_t		databits;              // stores all of the data bits
-volatile unsigned char	bitCount;              // number of bits currently captured
+volatile uint64_t		databits;	// stores all of the data bits
+volatile unsigned char	bitCount;	// number of bits currently captured
 
 time_t					 closeTime = 0, lastAuth = 0, bootTime;
 int						 haveFRAM = 0;
@@ -241,13 +243,19 @@ void wshandleTare(void);
 void wshandleSchedule(void);
 void wshandleScheduleSave(void);
 void wshandleEngineering(void);
+void wshandleMaintenance(void);
 void wshandleDoEngineering(void);
+void wshandleDownloadConfig(void);
 void wshandleSSL(void);
 void wshandleSaveSSL(void);
 void wshandleDygraphJS(void);
 void wshandleDygraphCSS(void);
 void wshandleGraphData(void);
 void wshandleFavIcon(void);
+void wshandleUpload(void);
+void wshandleUploadResult(void);
+void wsFirmwareUpdate(void);
+void wsFirmwareUpdateResult(void);
 
 int checkCard(uint8_t, uint16_t);
 const char *catName(uint8_t, uint16_t);
@@ -274,6 +282,8 @@ void saveNvData(void);
 void initNvData(void);
 void saveNvHistory(void);
 void initNvHistory(void);
+void configToJson(char **);
+void jsonToConfig(const char *);
 uint8_t getNextAlarm(void);
 uint8_t getCurrentAlarm(void);
 void setAlarm(uint8_t);
@@ -528,6 +538,7 @@ setup()
 	webserver.on("/calibrate", wshandleCalibrate);
 	webserver.on("/docalibrate", wshandleDoCalibrate);
 	webserver.on("/engineering", wshandleEngineering);
+	webserver.on("/maintenance", wshandleMaintenance);
 	webserver.on("/doengineering", wshandleDoEngineering);
 	webserver.on("/tare", wshandleTare);
 	webserver.on("/schedule", wshandleSchedule);
@@ -538,6 +549,9 @@ setup()
 	webserver.on("/dygraph.css", wshandleDygraphCSS);
 	webserver.on("/data.txt", wshandleGraphData);
 	webserver.on("/favicon.ico", wshandleFavIcon);
+	webserver.on("/configuration.json", wshandleDownloadConfig);
+	webserver.on("/upload", HTTP_POST, wshandleUploadResult, wshandleUpload);
+	webserver.on("/fwupdate", HTTP_POST, wsFirmwareUpdateResult, wsFirmwareUpdate);
 	webserver.onNotFound(wshandle404);
 	webserver.begin();
 	ArduinoOTA.begin();
@@ -557,8 +571,8 @@ loop()
 	static int	 menupos = 0;
 	int			 BleDataPos = 0;
 	const char	*text;
-	uint8_t		 facilityCode = 0, alarmIdx, alarmNextIdx;      // decoded facility code
-	uint16_t	 cardCode = 0;          // decoded card code
+	uint8_t		 facilityCode = 0, alarmIdx, alarmNextIdx;	// decoded facility code
+	uint16_t	 cardCode = 0;								// decoded card code
 	float		 dispensed;
 	
 	ArduinoOTA.handle();
@@ -587,9 +601,9 @@ loop()
 			}
 		}
 
-        if (menupos < 0 || ++menupos == 64)
-            menupos = 0;
-        menudata[menupos] = '\0';
+		if (menupos < 0 || ++menupos == 64)
+			menupos = 0;
+		menudata[menupos] = '\0';
 		if (nvdata.state & STATE_MENU_SELECT && menupos == 1) {
 			switch (menudata[menupos - 1]) {
 			  case 'c': {
@@ -636,6 +650,7 @@ loop()
 				Serial.print(text);
 				saveSettings();
 				saveNvData();
+				NimBLEDevice::deleteAllBonds();
 				NimBLEDevice::deinit();
 				ESP.restart();
 				break;
@@ -723,7 +738,7 @@ loop()
 			nvdata.state |= STATE_MENU_SELECT;
 		}
 
-    }
+	}
 
 	if (NimBLEDevice::getInitialized() && conf.BLEtimeout && !(nvdata.state & STATE_BLE_CONNECTED) &&
 	  nvdata.state & STATE_GOT_TIME && time(NULL) - bootTime > conf.BLEtimeout * 60) {
@@ -744,9 +759,9 @@ loop()
 			alarmIdx = getCurrentAlarm();
 			alarmNextIdx = getNextAlarm();
 			if (conf.schedule[alarmIdx].weight)
-			    feedWeight = conf.schedule[alarmIdx].weight;
+				feedWeight = conf.schedule[alarmIdx].weight;
 			else
-			    feedWeight = conf.perFeed;
+				feedWeight = conf.perFeed;
 
 			// We may already have dispensed the quota but that will 
 			// be caught later.
@@ -1152,6 +1167,7 @@ initNvData(void)
 			Wire.setClock(clock);
 	}
 	if (nvdata.magic != MAGIC || nvdata.crc != CRC16.ccitt((uint8_t *)&nvdata, sizeof(struct nvdata) - 2)) {
+		nvdata.state &= ~STATE_BLE_CONNECTED;
 		debug(false, "Resetting persistent records");
 		nvdata.dispensedTotal = 0;
 		nvdata.state = 0;
@@ -1261,6 +1277,143 @@ initConfig(void)
 	scale.set_offset(conf.offset);
 }
 
+void
+configToJson(char **sDoc)
+{
+	DynamicJsonDocument		jdoc(2048 + MAX_CERT);
+	DynamicJsonDocument		jntfy(1024);
+	DynamicJsonDocument		jcats(1024);
+	DynamicJsonDocument		jschedules(2048);
+	int						len;
+	char					flags[11];
+
+	jdoc["hostname"] = conf.hostname;
+	jdoc["cal-factor"] = conf.scale;
+	jdoc["cal-offset"] = conf.offset;
+	jdoc["ssid"] = conf.ssid;
+	jdoc["wpakey"] = conf.wpakey;
+	jdoc["BLEtimeout"] = conf.BLEtimeout;
+	jdoc["ntpserver"] = conf.ntpserver;
+	jdoc["timezone"] = conf.timezone;
+	jdoc["quota"] = conf.quota;
+	jdoc["perFeed"] = conf.perFeed;
+	jdoc["cooloff"] = conf.cooloff;
+	snprintf(flags, 11, "0x%08x", conf.flags);
+	jdoc["flags"] = flags;
+	jntfy["password"] = conf.ntfy.password;
+	jntfy["username"] = conf.ntfy.username;
+	jntfy["url"] = conf.ntfy.url;
+	jntfy["topic"] = conf.ntfy.topic;
+	jdoc["ntfy"] = jntfy;
+	jdoc["snmpro"] = conf.snmpro;
+	jdoc["snmprw"] = conf.snmprw;
+	for (int i = 0; i < CFG_NCATS; i++) {
+		StaticJsonDocument<100>	jcat;
+		jcat["name"] = conf.cat[i].name;
+		snprintf(flags, 11, "0x%04x", conf.cat[i].flags);
+		jcat["flags"] = flags;
+		jcat["facility"] = conf.cat[i].facility;
+		jcat["id"] = conf.cat[i].id;
+		jcats.add(jcat);
+	}
+	jdoc["cats"] = jcats;
+	for (int i = 0; i < CFG_NSCHEDULES; i++) {
+		StaticJsonDocument<100>	jsched;
+		snprintf(flags, 11, "0x%02x", conf.schedule[i].flags);
+		jsched["flags"] = flags;
+		jsched["hour"] = conf.schedule[i].hour;
+		jsched["minute"] = conf.schedule[i].minute;
+		jsched["weight"] = conf.schedule[i].weight;
+		jschedules.add(jsched);
+	}
+	jdoc["schedule"] = jschedules;
+	jdoc["ca"] = conf.cacrt;
+	len = measureJsonPretty(jdoc);
+	if ((*sDoc = (char *)malloc(len + 1)) != NULL) {
+		serializeJsonPretty(jdoc, *sDoc, len + 1);
+	}
+}
+
+void
+jsonToConfig(const char *sDoc)
+{
+	DynamicJsonDocument		 jdoc(2048 + MAX_CERT);
+	DeserializationError	 err;
+	const char				*s;
+	char					*p;
+
+	if ((err = deserializeJson(jdoc, sDoc))) {
+		debug(true, "deserializeJson() failed: %s", err.c_str());
+		return;
+	}
+
+	if (jdoc.containsKey("cal-factor"))
+		conf.scale = jdoc["cal-factor"];
+	if (jdoc.containsKey("cal-offset"))
+		conf.offset = jdoc["cal-offset"];
+	if ((s = jdoc["hostname"]) != NULL)
+		strncpy(conf.hostname, s, 32);
+	if ((s = jdoc["ssid"]) != NULL)
+		strncpy(conf.ssid, s, 64);
+	if ((s = jdoc["wpakey"]) != NULL)
+		strncpy(conf.wpakey, s, 64);
+	if (jdoc.containsKey("BLEtimeout"))
+		conf.BLEtimeout = jdoc["BLEtimeout"];
+	if ((s = jdoc["ntpserver"]) != NULL)
+		strncpy(conf.ntpserver, s, 64);
+	if (jdoc.containsKey("quota"))
+		conf.quota = jdoc["quota"];
+	if (jdoc.containsKey("perFeed"))
+		conf.perFeed = jdoc["perFeed"];
+	if (jdoc.containsKey("cooloff"))
+		conf.cooloff = jdoc["cooloff"];
+	if ((s = jdoc["flags"]) != NULL)
+		conf.flags = strtoul(s, &p, 0);
+	if (jdoc.containsKey("ntfy")) {
+		if ((s = jdoc["ntfy"]["password"]) != NULL)
+			strncpy(conf.ntfy.password, s, 16);
+		if ((s = jdoc["ntfy"]["username"]) != NULL)
+			strncpy(conf.ntfy.username, s, 16);
+		if ((s = jdoc["ntfy"]["url"]) != NULL)
+			strncpy(conf.ntfy.url, s, 64);
+		if ((s = jdoc["ntfy"]["topic"]) != NULL)
+			strncpy(conf.ntfy.topic, s, 64);
+	}
+	if ((s = jdoc["snmpro"]) != NULL)
+		strncpy(conf.snmpro, s, 64);
+	if ((s = jdoc["snmprw"]) != NULL)
+		strncpy(conf.snmprw, s, 64);
+	if (jdoc.containsKey("cats")) {
+		for (int i = 0; i < jdoc["cats"].size() && i < CFG_NCATS; i++) {
+			if ((s = jdoc["cats"][i]["name"]) != NULL)
+				strncpy(conf.cat[i].name, s, 20);
+			if ((s = jdoc["cats"][i]["flags"]) != NULL)
+				conf.cat[i].flags = strtoul(s, &p, 0);
+			if (jdoc["cats"][i].containsKey("facility"))
+				conf.cat[i].facility = jdoc["cats"][i]["facility"];
+			if (jdoc["cats"][i].containsKey("id"))
+				conf.cat[i].id = jdoc["cats"][i]["id"];
+		}
+	}
+	if (jdoc.containsKey("schedule")) {
+		for (int i = 0; i < jdoc["schedule"].size() && i < CFG_NSCHEDULES; i++) {
+			if ((s = jdoc["schedule"][i]["flags"]) != NULL)
+				conf.schedule[i].flags = strtoul(s, &p, 0);
+			if (jdoc["schedule"][i].containsKey("hour"))
+				conf.schedule[i].hour = jdoc["schedule"][i]["hour"];
+			if (jdoc["schedule"][i].containsKey("minute"))
+				conf.schedule[i].minute = jdoc["schedule"][i]["minute"];
+			if (jdoc["schedule"][i].containsKey("weight"))
+				conf.schedule[i].weight = jdoc["schedule"][i]["weight"];
+		}
+	}
+	if ((s = jdoc["ca"]) != NULL)
+		strncpy(conf.cacrt, s, MAX_CERT);
+
+	qsort(conf.schedule, CFG_NSCHEDULES, sizeof(struct schedule), comparSchedule);
+	setAlarm(getNextAlarm());
+}
+
 uint8_t
 getNextAlarm(void)
 {
@@ -1332,37 +1485,37 @@ getResetReason(void)
 {
 	const char	*reason;
 	switch (esp_reset_reason()) {
-	  case ESP_RST_UNKNOWN:    //!< Reset reason can not be determined
+	  case ESP_RST_UNKNOWN:		//!< Reset reason can not be determined
 		reason = "Unkown";
 		break;
-	  case ESP_RST_POWERON:    //!< Reset due to power-on event
+	  case ESP_RST_POWERON:		//!< Reset due to power-on event
 		reason = "Power-on";
 		break;
-	  case ESP_RST_EXT:        //!< Reset by external pin (not applicable for ESP32)
+	  case ESP_RST_EXT:			//!< Reset by external pin (not applicable for ESP32)
 		reason = "External reset";
 		break;
-	  case ESP_RST_SW:         //!< Software reset via esp_restart
+	  case ESP_RST_SW:			//!< Software reset via esp_restart
 		reason = "Software reset";
 		break;
-	  case ESP_RST_PANIC:      //!< Software reset due to exception/panic
+	  case ESP_RST_PANIC:		//!< Software reset due to exception/panic
 		reason = "Panic";
 		break;
-	  case ESP_RST_INT_WDT:    //!< Reset (software or hardware) due to interrupt watchdog
+	  case ESP_RST_INT_WDT:		//!< Reset (software or hardware) due to interrupt watchdog
 		reason = "Interrupt watchdog";
 		break;
-	  case ESP_RST_TASK_WDT:   //!< Reset due to task watchdog
+	  case ESP_RST_TASK_WDT:	//!< Reset due to task watchdog
 		reason = "Task watchdog";
 		break;
-	  case ESP_RST_WDT:        //!< Reset due to other watchdogs
+	  case ESP_RST_WDT:			//!< Reset due to other watchdogs
 		reason = "Watchdog";
 		break;
-	  case ESP_RST_DEEPSLEEP:  //!< Reset after exiting deep sleep mode
+	  case ESP_RST_DEEPSLEEP:	//!< Reset after exiting deep sleep mode
 		reason = "Deep sleep";
 		break;
-	  case ESP_RST_BROWNOUT:   //!< Brownout reset (software or hardware)
+	  case ESP_RST_BROWNOUT:	//!< Brownout reset (software or hardware)
 		reason = "Brownout";
 		break;
-	  case ESP_RST_SDIO:       //!< Reset over SDIO
+	  case ESP_RST_SDIO:		//!< Reset over SDIO
 		reason = "SDIO";
 		break;
 	}
@@ -1378,11 +1531,11 @@ comparSchedule(const void *a, const void *b)
 void
 debug(bool logtime, const char *format, ...)
 {
-	va_list    pvar;
-	static char       str[128];
-	static char       timestr[20];
-	time_t     t = time(NULL);
-	struct tm *tm = localtime(&t);
+	va_list			 pvar;
+	static char		 str[128];
+	static char		 timestr[20];
+	time_t			 t = time(NULL);
+	struct tm		*tm = localtime(&t);
 	
 	if (logtime && nvdata.state & STATE_GOT_TIME) {
 		strftime(timestr, 20, "%F %T", tm);
@@ -1503,51 +1656,54 @@ wshandleRoot(void) {
 		alarm1.toString(alarm1Date);
 	}
 	snprintf(body, 2048,
-	  "<!doctype html>"
-	  "<html lang='en'>"
-	  "<head>"
-	  "<meta charset='UTF-8'>"
-	  "<title>Feeder [%s]</title>"
-	  "<script src='dygraph.min.js'></script>"
-	  "<link rel='stylesheet' type='text/css' href='dygraph.css'>"
-	"<link rel='icon' type='image/x-icon' href='/favicon.ico'>"
-	  "<style>"
-	    "body {background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088;}"
-		".dygraph-legend {text-align: right;background: none;}</style>"
-	  "</head>"
-	  "<body>"
-	  "<h1>Feeder %s</h1>"
-	  "%s<br>"
-	  "%s"
-	  "<p>Next dispense: %s</p>"
-	  "<p>Weight: %3.0f g</p>"
-	  "<p>Dispensed: %3.0f of %3d g</p>"
-	  "<p><a href='/config'>System Configuration</a></p>"
-	  "<p><a href='/schedule'>Feed Dispensing Schedule</a></p>"
-	  "<form method='post' action='/feed' name='Feed'>"
-		"Dispense grams:&nbsp;<input name='weight' type='number' size='4' value='%d' min='1' max='25'>"
-		"<input name='Feed' type='submit' value='Feed'>"
-	  "</form>"
-	  "<div id='history' style='width:600px; height:300px;'></div>"
-	  "<p><font size=1>"
-	  "<a href='/tare'>Zero the scale</a><br>"
-	  "Uptime: %d days %02d:%02d:%02d<br>"
-	  "Firmware: " __DATE__ " " __TIME__ "<br>"
-	  "</font>"
-	  "<script>Dygraph.onDOMready(function onDOMready() {"
-		"new Dygraph(document.getElementById('history'), 'data.txt', "
-		"{title: 'Feeding history', legend: 'always', ylabel: 'Weight', showRangeSelector: true, includeZero: true});"
-	  "});"
-	  "</script>"
-	  "</body>"
-	  "</html>",
+	  R"(<!doctype html>
+	  <html lang='en'>
+	  <head>
+	  <meta charset='UTF-8'>
+	  <meta http-equiv='Refresh' content='1200; url=/'>
+	  <title>Feeder [%s]</title>
+	  <script src='dygraph.min.js'></script>
+	  <link rel='stylesheet' type='text/css' href='dygraph.css'>
+	  <link rel='icon' type='image/x-icon' href='/favicon.ico'>
+	  <style>
+		body {background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088;}
+		.dygraph-legend {text-align: right;background: none;}</style>
+	  </head>
+	  <body>
+	  <h1>Feeder %s</h1>
+	  %s<br>%s%s
+	  <p>Next dispense: %s</p>
+	  <p>Weight: %3.0f g</p>
+	  <p>Dispensed: %3.0f of %3d g</p>
+	  <form method='post' action='/feed' name='Feed'>
+		Dispense grams:&nbsp;<input name='weight' type='number' size='4' value='%d' min='1' max='25'>
+		<input name='Feed' type='submit' value='Feed'>
+	  </form>
+	  <div id='history' style='width:600px; height:300px;'></div>
+	  <p><a href='/config'>System Configuration</a></p>
+	  <p><a href='/schedule'>Feed Dispensing Schedule</a></p>
+	  <p><a href='/maintenance'>Maintenance</a></p>
+	  <p><font size=1>
+	  <a href='/tare'>Zero the scale</a><br>
+	  Uptime: %d days %02d:%02d:%02d<br>
+	  Firmware: %s %s<br>
+	  </font>
+	  <script>Dygraph.onDOMready(function onDOMready() {
+		new Dygraph(document.getElementById('history'), 'data.txt',
+		{title: 'Feeding history', legend: 'always', ylabel: 'Weight', showRangeSelector: true, includeZero: true});
+	  });
+	  </script>
+	  </body>
+	  </html>)",
 	  conf.hostname, conf.hostname,
 	  timestr,
+	  NimBLEDevice::getInitialized() ? "<p style='color: #AA0000;'>BlueTooth Advertising</p>" : "",
 	  nvdata.state & STATE_CHECK_HOPPER ? "<p style='color: #AA0000;'>Check Hopper</p>" : "",
 	  ~nvdata.state & STATE_NO_SCHEDULE ? alarm1Date : "No Schedule",
 	  weigh(true), nvdata.dispensedTotal, conf.quota,
 	  conf.perFeed,
-	  sec / 86400, hr % 24, min % 60, sec % 60
+	  sec / 86400, hr % 24, min % 60, sec % 60,
+	  __DATE__, __TIME__
 	);
 	webserver.sendHeader("cache-control", "no-store", false);
 	webserver.send(200, "text/html", body);
@@ -1659,7 +1815,7 @@ wshandleReboot()
 	  "<body>\n"
 	  "<h1>Feeder %s</h1>"
 	  "Rebooting<BR>"
-	  "<meta http-equiv='Refresh' content='5; url=/'>"
+	  "<meta http-equiv='Refresh' content='2; url=/'>"
 	  "</body>\n"
 	  "</html>", conf.hostname, conf.hostname);
 	  
@@ -1674,7 +1830,7 @@ wshandleReboot()
 void 
 wshandle404(void)
 {
-	String	 message = "File Not Found\n\n";
+	String	 message = "Not Found\n\n";
 
 	message += "URI: ";
 	message += webserver.uri();
@@ -1714,6 +1870,179 @@ wshandleDygraphCSS(void)
 }
 
 void
+wshandleMaintenance(void)
+{
+	char	*body;
+
+	if ((body = (char *)malloc(1024)) == NULL) {
+		debug(true, "WEB / failed to allocate memory");
+		return;
+	}
+	snprintf(body, 1024,
+	R"(<!DOCTYPE html>
+	<html lang='en'>
+	<head>
+		<meta charset='utf-8'>
+		<meta name='viewport' content='width=device-width,initial-scale=1'/>
+		<style>body {background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088;}</style>
+		<title>Feeder [%s]</title>
+		<link rel='icon' type='image/x-icon' href='/favicon.ico'>
+	</head>
+	<body>
+	<h1>Feeder %s</h1>
+	<p><a href='/configuration.json'>Download configuration file</a></p>
+	<p><form method='POST' action='/upload' enctype='multipart/form-data'>
+		Configuration:<br><input type='file' accept='.json' name='configuration'>
+		<input type='submit' value='Restore'>
+	</form>
+	<p><form method='POST' action='/fwupdate' enctype='multipart/form-data'>
+		Firmware:<br><input type='file' accept='.bin' name='firmware'>
+		<input type='submit' value='Install'>
+	</form>
+	</body>
+	</html>)",
+	conf.hostname, conf.hostname);
+
+	webserver.sendHeader("cache-control", "public, max-age=86400", false);
+	webserver.send(200, "text/html", body);
+	free(body);
+}
+
+void
+wshandleDownloadConfig(void)
+{
+	char *jConfig;
+
+	configToJson(&jConfig);
+	if (jConfig) {
+		webserver.sendHeader("cache-control", "no-store", false);
+		webserver.sendHeader("Content-Disposition", "attachment", false);
+		webserver.send_P(200, "text/plain", jConfig);
+		free(jConfig);
+	}
+}
+
+void
+wshandleUploadResult(void)
+{
+	char	*body;
+	if ((body = (char *)malloc(500)) == NULL) {
+		debug(true, "WEB / failed to allocate memory");
+		return;
+	}
+	snprintf(body, 500,
+	"<!doctype html>"
+	"<html lang='en'>\n"
+	"<head>\n"
+	"<title>Feeder [%s]</title>\n"
+	"<link rel='icon' type='image/x-icon' href='/favicon.ico'>"
+	"<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
+	"</head>\n"
+	"<body>\n"
+	"<h1>Feeder %s</h1>"
+	"Configuration updated.<br>Check System and schedules.<br>Save to commit."
+	"<meta http-equiv='Refresh' content='5; url=/'>"
+	"</body>\n"
+	"</html>", conf.hostname, conf.hostname);
+
+	webserver.sendHeader("cache-control", "no-store", false);
+	webserver.send(200, "text/html", body);
+	free(body);
+}
+
+void
+wshandleUpload(void)
+{
+	static char	*data = NULL;
+	HTTPUpload& upload = webserver.upload();
+
+	switch (upload.status) {
+	  case UPLOAD_FILE_START:
+		debug(true, "Upload started. Filename: %s", upload.filename.c_str());
+		break;
+	  case UPLOAD_FILE_WRITE:
+		if ((data = (char *)realloc(data, upload.currentSize + upload.totalSize + 1)) != NULL) {
+			memcpy(data + upload.totalSize, upload.buf, upload.currentSize);
+		}
+		break;
+	  case UPLOAD_FILE_END:
+		debug(true, "Upload end");
+		if (data) {
+			data[upload.totalSize] = '\0';
+			jsonToConfig(data);
+			free(data);
+			data = NULL;
+		}
+		break;
+	  case UPLOAD_FILE_ABORTED:
+		if (data) {
+			free(data);
+			data = NULL;
+		}
+		break;
+	}
+}
+
+void
+wsFirmwareUpdate(void)
+{
+	HTTPUpload& upload = webserver.upload();
+	switch (upload.status) {
+	  case UPLOAD_FILE_START:
+		if (upload.name == "firmware") {
+			uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+			if (!Update.begin(maxSketchSpace, U_FLASH)) {
+				debug(true, "Update error: %s", Update.errorString());
+			}
+			debug(true, "Firmware Update Start");
+		}
+		break;
+	  case UPLOAD_FILE_WRITE:
+		if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+			debug(true, "Firmware Update error: %s", Update.errorString());
+		}
+		break;
+	  case UPLOAD_FILE_END:
+		if (Update.end(true)) { //true to set the size to the current progress
+			debug(true, "Firmware Update Done writing");
+		}
+		else {
+			debug(true, "Firmware Update error: %s", Update.errorString());
+		}
+		break;
+	  case UPLOAD_FILE_ABORTED:
+		Update.end();
+		debug(true, "Firmware Update was aborted");
+		break;
+	}
+}
+
+void
+wsFirmwareUpdateResult(void)
+{
+	char	*body;
+
+	if ((body = (char *)malloc(400)) == NULL) {
+		debug(true, "WEB / failed to allocate memory");
+		return;
+	}
+
+	webserver.sendHeader("cache-control", "no-store", false);
+
+	if (Update.hasError()) {
+		webserver.send(200, F("text/html"), "Update error");
+		free(body);
+	}
+	else {
+		webserver.client().setNoDelay(true);
+		webserver.send_P(200, PSTR("text/html"), "<META http-equiv=\"refresh\" content=\"15;URL=/\">Update Success! Rebooting...");
+		delay(100);
+		webserver.client().stop();
+		ESP.restart();
+	}
+}
+
+void
 wshandleGraphData(void)
 {
 	char	*body, *p;
@@ -1735,7 +2064,7 @@ wshandleGraphData(void)
 			continue;
 		td = t - i * 86400;
 		tm = localtime(&td);
-		strftime(timestr, 20, "%F", tm);
+		strftime(timestr, 13, "%F", tm);
 
 		len = sprintf(p, "%s, %5.1f\n", timestr,
 		  history.day[i].start + (i == 0 ? nvdata.dispensedTotal : history.day[i].dispensed) -
@@ -1790,7 +2119,7 @@ wshandleConfig(void)
 		  "<tr><td width='30%%'>Per feed:</td><td><input name='perfeed' type='number' size='4' value='%d' min='1' max='25'>grams</td></tr>\n"
 		  "<tr><td width='30%%'>Close to feed:</td><td><input name='ctf' type='checkbox' value='true' %s></td></tr>\n"
 		  "<tr><td width='30%%'>Feed cooloff:</td><td><input name='cooloff' type='number' size='4' value='%d' min='0' max='120'> Minutes</td></tr>\n"
-		  "<tr><td>&nbs;p</td><td>&nbsp;</td></tr>"
+		  "<tr><td>&nbsp;</td><td>&nbsp;</td></tr>"
 		  "<tr><td width='30%%'>Notifications:</td><td><input name='ntfy' type='checkbox' value='true' %s></td></tr>\n"
 		  "<tr><td width='30%%'>Events:</td><td>"
 			"<table border=0 cellspacing=0 cellpadding=0>\n"
@@ -2289,9 +2618,9 @@ if ((temp = (char *)malloc(400)) == NULL)
 		if (value.length()) {
 		  int h, m;
 		  if (sscanf(value.c_str(), "%d:%d", &h, &m) == 2 ) {
-		    if (h >= 0 && h <= 23)
+			if (h >= 0 && h <= 23)
 				conf.schedule[i].hour = h;
-		    if (m >= 0 && m <= 59)
+			if (m >= 0 && m <= 59)
 				conf.schedule[i].minute = m;
 		  }
 		}
