@@ -15,6 +15,8 @@ and
 - 10 individually configurable dispensing schedules.
 - RFID access control to food and intruder lockout.
 - Web interface for configuration.
+- Web firmware upload.
+- Configuration backup and restore.
 - Push notifications using [ntfy.sh](https://ntfy.sh) wsupporting either the free or self-hosted service.
   - Visitation.
   - Intruder alerts.
