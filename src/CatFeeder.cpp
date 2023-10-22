@@ -814,7 +814,7 @@ loop()
 			}
 			history.day[0].start = weigh(true);
 			saveNvHistory();
-			nvdata.dispensedTotal = 0;
+			nvdata.dispensedTotal = history.day[0].start;
 			debug(true, "Reset dispensed total");
 		}
 		saveNvData();
