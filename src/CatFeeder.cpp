@@ -163,6 +163,7 @@ struct nvhistory {
 #define WEIGAND_TIMEOUT		20	// timeout in ms on Wiegand sequence 
 #define DOOR_TIMEOUT		60	// Door stays locked for max X seconds
 #define SETTLING_TIME		3
+#define VISIT_TIMEOUT		180 // End visitation when the last card read is 180s ago
 
 #define PIN_RTC_INTR		19
 
@@ -804,14 +805,14 @@ loop()
 				dispensed = dispense(feedWeight);
 				nvdata.dispensedTotal += dispensed;
 				debug(true, "Auto-dispense: %3.0fg of %dg Dispensed total: %3.0fg of %dg Next dispense: %02d:%02d",
-					dispensed, feedWeight, nvdata.dispensedTotal, conf.quota, conf.schedule[alarmNextIdx].hour, conf.schedule[alarmNextIdx].minute);
+					dispensed, feedWeight, history.day[0].start + nvdata.dispensedTotal, conf.quota, conf.schedule[alarmNextIdx].hour, conf.schedule[alarmNextIdx].minute);
 				if (conf.flags & CFG_NTFY_DISPENSE)
 					ntfy(WiFi.getHostname(), "alarm_clock", 3, "Auto-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg\\nNext dispense: %02d:%02d",
 					  dispensed, feedWeight, nvdata.dispensedTotal, conf.quota, conf.schedule[alarmNextIdx].hour, conf.schedule[alarmNextIdx].minute);
 			}
 			else {
 				debug(true, "Auto-dispense: Skipped. Dispensed total: %3.0fg of %dg Next dispense: %02d:%02d",
-					nvdata.dispensedTotal, conf.quota, conf.schedule[alarmNextIdx].hour, conf.schedule[alarmNextIdx].minute);
+					history.day[0].start + nvdata.dispensedTotal, conf.quota, conf.schedule[alarmNextIdx].hour, conf.schedule[alarmNextIdx].minute);
 				if (conf.flags & CFG_NTFY_DISPENSE)
 					ntfy(WiFi.getHostname(), "alarm_clock", 3, "Auto-dispense: Skipped (%s%s%s)\\n"
 					  "Dispensed total: %3.0fg of %dg\\n"
@@ -850,7 +851,7 @@ loop()
 	}
 
 	weigh(false);
-	if (npState & STATE_WEIGHTREPORT && time(NULL) - lastAuth > 180) {
+	if (npState & STATE_WEIGHTREPORT && time(NULL) - lastAuth > VISIT_TIMEOUT) {
 		float curWeight = weigh(true);
 		if (conf.flags & CFG_NTFY_VISIT)
 			ntfy(WiFi.getHostname(), "balance_scale", 3, "This Feed: %3.0fg\\nConsumed today: %3.0f\\nDispensed total: %3.0fg of %dg",
@@ -918,7 +919,7 @@ checkCard(uint8_t facilityCode, uint16_t cardCode)
 			startWeight = weigh(true);
 		if (~npState & STATE_OPEN && openAfter - time(NULL) > SETTLING_TIME)
 			openDoor();
-		if (time(NULL) - lastAuth > 120) {
+		if (time(NULL) - lastAuth > VISIT_TIMEOUT) {
 			debug(true, "Authorized: %s", catName(facilityCode, cardCode));
 			if (conf.flags & CFG_NTFY_VISIT)
 				ntfy(WiFi.getHostname(), "plate_with_cutlery", 3, "Authorized: %s\\nStart weight: %3.0fg", catName(facilityCode, cardCode), weigh(true));
