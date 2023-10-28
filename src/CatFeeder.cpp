@@ -770,8 +770,8 @@ loop()
 
 	if (~npState & STATE_BOOTUP_NTFY && npState & STATE_GOT_IP_ADDR) {
 		if (conf.flags & CFG_NTFY_NOTICE)
-			ntfy(WiFi.getHostname(), "facepalm", 3, "Boot up %6.3f seconds ago\\nReset reason: %s\\nFirmware: %s %s",
-				millis() / 1000.0, getResetReason(), __DATE__, __TIME__);
+			ntfy(WiFi.getHostname(), "facepalm", 3, "Boot up %6.3f seconds ago\\nReset reason: %s\\nFirmware: %s",
+				millis() / 1000.0, getResetReason(), AUTO_VERSION);
 		npState |= STATE_BOOTUP_NTFY;
 	}
 
@@ -1749,7 +1749,7 @@ wshandleRoot(void) {
 	  <p><a href='/maintenance'>Maintenance</a></p>
 	  <p><font size=1>
 	  Uptime: %d days %02d:%02d:%02d<br>
-	  Firmware: %s %s<br>
+	  Firmware: %s<br>
 	  </font>
 	  <script>Dygraph.onDOMready(function onDOMready() {
 		new Dygraph(document.getElementById('history'), 'data.txt',
@@ -1768,7 +1768,7 @@ wshandleRoot(void) {
 	  weigh(true), history.day[0].start + nvdata.dispensedTotal, conf.quota,
 	  conf.perFeed,
 	  sec / 86400, hr % 24, min % 60, sec % 60,
-	  __DATE__, __TIME__
+	  AUTO_VERSION
 	);
 	webserver.sendHeader("cache-control", "no-store", false);
 	webserver.send(200, "text/html", body);
