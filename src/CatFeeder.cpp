@@ -1128,7 +1128,7 @@ getDispenseWeight(float curWeight)
 	if (feedWeight < 0)
 		feedWeight = 0;
 	if (history.day[0].start + nvdata.dispensedTotal + feedWeight > conf.quota)
-		feedWeight = conf.quota - nvdata.dispensedTotal;
+		feedWeight = conf.quota - (nvdata.dispensedTotal + history.day[0].start);
 
 	return(feedWeight);
 }
