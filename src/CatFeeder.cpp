@@ -55,7 +55,7 @@
 struct schedule {
 	uint8_t	hour;
 	uint8_t	minute;
-	uint8_t	weight;
+	uint8_t	pad;
 	uint8_t	flags;
 } __attribute__((__packed__));
 
@@ -76,7 +76,7 @@ struct cfg {
 		uint8_t		flags;
 	} cat[CFG_NCATS];
 	char		pad;
-	uint8_t		perFeed;
+	uint8_t		maxFood;
 	uint8_t		quota;
 	uint8_t		cooloff;
 	struct schedule schedule[CFG_NSCHEDULES];
@@ -279,6 +279,7 @@ const char *catName(uint8_t, uint16_t);
 const char *getResetReason(void);
 int comparSchedule(const void *, const void *);
 float weigh(bool);
+float getDispenseWeight(float);
 int snmpGetWeight(void);
 int snmpGetTemp(void);
 int snmpGetUptime(void);
@@ -775,7 +776,7 @@ loop()
 		npState |= STATE_BOOTUP_NTFY;
 	}
 
-	if (npState & STATE_RTC_INTR) {
+	if (npState & STATE_RTC_INTR && time(NULL) - lastAuth > VISIT_TIMEOUT) {
 		npState &= ~STATE_RTC_INTR;
 		if (rtc.alarmFired(1)) {
 			uint8_t feedWeight;
@@ -787,19 +788,11 @@ loop()
 			rtc.clearAlarm(1);
 			alarmIdx = getCurrentAlarm();
 			alarmNextIdx = getNextAlarm();
-			if (conf.schedule[alarmIdx].weight)
-				feedWeight = conf.schedule[alarmIdx].weight;
-			else
-				feedWeight = conf.perFeed;
 
-			// We may already have dispensed the quota but that will 
-			// be caught later.
-			if (nvdata.dispensedTotal + feedWeight > conf.quota)
-				feedWeight = abs(conf.quota - nvdata.dispensedTotal);
-			
 			curWeight = weigh(true);
-			reason1 = weigh(true) > feedWeight / 2.0 ? "High residual weight" : "";
-			reason2 = time(NULL) < nvdata.skipDispenseUntil ? "Dispense cooloff" : "";
+			feedWeight = getDispenseWeight(curWeight);
+			reason1 = time(NULL) < nvdata.skipDispenseUntil ? "Dispense cooloff" : "";
+			reason2 = feedWeight == 0 ? "Target dispense is zero" : "";
 
 			if (!((conf.schedule[alarmIdx].flags & CFG_SCHED_SKIP) && (~nvdata.state & NVSTATE_CHECK_HOPPER) && (*reason1 || *reason2))) {
 				dispensed = dispense(feedWeight);
@@ -857,7 +850,7 @@ loop()
 			ntfy(WiFi.getHostname(), "balance_scale", 3, "This Feed: %3.0fg\\nConsumed today: %3.0f\\nDispensed total: %3.0fg of %dg",
 			  startWeight - curWeight, history.day[0].start + nvdata.dispensedTotal - curWeight, history.day[0].start +
 			  nvdata.dispensedTotal, conf.quota);
-		if (startWeight - curWeight > conf.perFeed /2.0)
+		if (startWeight - curWeight > conf.maxFood / 2.0)
 			nvdata.skipDispenseUntil = time(NULL) + conf.cooloff * 60;
 		startWeight = 0;
 		npState &= ~STATE_WEIGHTREPORT;
@@ -898,7 +891,7 @@ loop()
 int
 checkCard(uint8_t facilityCode, uint16_t cardCode)
 {
-	float	 dispensed;
+	float	 dispensed, weight;
 	int		 i;
 
 	for (i = 0; i < CFG_NCATS; i++)
@@ -927,10 +920,11 @@ checkCard(uint8_t facilityCode, uint16_t cardCode)
 		lastAuth = time(NULL);
 	}
 	else if (conf.cat[i].flags & CFG_CAT_DISPENSE) {
-		dispensed = dispense(conf.perFeed);
+		weight = getDispenseWeight(weigh(true));
+		dispensed = dispense(weight);
 		nvdata.dispensedTotal += dispensed;
 		if (conf.flags & CFG_NTFY_DISPENSE)
-			ntfy(WiFi.getHostname(), "cook", 3, "Manual-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg", dispensed, conf.perFeed,
+			ntfy(WiFi.getHostname(), "cook", 3, "Manual-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg", dispensed, weight,
 				history.day[0].start + nvdata.dispensedTotal, conf.quota);
 	}
 	else { // Unknown cat
@@ -1027,12 +1021,10 @@ dispense(float grams)
 {
 	float	 startWeight = weigh(true), curWeight;
 
-	// Override cooloff period if the last dispense didn't fully succeed, but don't dispense more than the quota
-	if (~nvdata.state & NVSTATE_CHECK_HOPPER && (time(NULL) < nvdata.skipDispenseUntil) || nvdata.dispensedTotal >= conf.quota)
+	// Override cooloff period if the last dispense didn't fully succeed
+	if (~nvdata.state & NVSTATE_CHECK_HOPPER && (time(NULL) < nvdata.skipDispenseUntil)) {
 		return(0);
-
-	if (history.day[0].start + nvdata.dispensedTotal + grams > conf.quota)
-		grams = conf.quota - (nvdata.dispensedTotal + history.day[0].start);
+	}
 
 	debug(true, "Dispense %4.2f", grams);
 	if (conf.flags & CFG_DISPENSE_CLOSED)
@@ -1043,7 +1035,7 @@ dispense(float grams)
 	// if the kibbles don't get stuck. So, try rotating 4 as much as
 	// needed which works out to 2 revolution per gram.
 	curWeight = startWeight;
-	for(uint8_t i = 0, stop = 0; !stop && i < grams * 2; i++) {
+	for(uint8_t i = 0, stop = 0; !stop && i < conf.maxFood * 2; i++) {
 		digitalWrite(PIN_AUGER_DIR, AUGER_DIR_CW);
 		for (int i = 0; !stop && i < 3200; i++) {
 			digitalWrite(PIN_AUGER_STEP, HIGH);
@@ -1120,6 +1112,25 @@ weigh(bool doAverage)
 	for (int i = 0; i < 100; i++)
 		total += weight[i];
 	return(total / 100);
+}
+
+/*
+ * Calculate the top-off target weight, but do not exceed the daily quota
+ */
+float
+getDispenseWeight(float curWeight)
+{
+	float	feedWeight;
+
+	if (curWeight < 0)
+		curWeight = 0;
+	feedWeight = conf.maxFood - curWeight;
+	if (feedWeight < 0)
+		feedWeight = 0;
+	if (history.day[0].start + nvdata.dispensedTotal + feedWeight > conf.quota)
+		feedWeight = conf.quota - nvdata.dispensedTotal;
+
+	return(feedWeight);
 }
 
 int
@@ -1358,7 +1369,7 @@ configToJson(char **sDoc)
 	jdoc["ntpserver"] = conf.ntpserver;
 	jdoc["timezone"] = conf.timezone;
 	jdoc["quota"] = conf.quota;
-	jdoc["perFeed"] = conf.perFeed;
+	jdoc["maxFood"] = conf.maxFood;
 	jdoc["cooloff"] = conf.cooloff;
 	snprintf(flags, 11, "0x%08x", conf.flags);
 	jdoc["flags"] = flags;
@@ -1385,7 +1396,6 @@ configToJson(char **sDoc)
 		jsched["flags"] = flags;
 		jsched["hour"] = conf.schedule[i].hour;
 		jsched["minute"] = conf.schedule[i].minute;
-		jsched["weight"] = conf.schedule[i].weight;
 		jschedules.add(jsched);
 	}
 	jdoc["schedule"] = jschedules;
@@ -1425,8 +1435,8 @@ jsonToConfig(const char *sDoc)
 		strncpy(conf.ntpserver, s, 64);
 	if (jdoc.containsKey("quota"))
 		conf.quota = jdoc["quota"];
-	if (jdoc.containsKey("perFeed"))
-		conf.perFeed = jdoc["perFeed"];
+	if (jdoc.containsKey("maxFood"))
+		conf.maxFood = jdoc["maxFood"];
 	if (jdoc.containsKey("cooloff"))
 		conf.cooloff = jdoc["cooloff"];
 	if ((s = jdoc["flags"]) != NULL)
@@ -1465,8 +1475,6 @@ jsonToConfig(const char *sDoc)
 				conf.schedule[i].hour = jdoc["schedule"][i]["hour"];
 			if (jdoc["schedule"][i].containsKey("minute"))
 				conf.schedule[i].minute = jdoc["schedule"][i]["minute"];
-			if (jdoc["schedule"][i].containsKey("weight"))
-				conf.schedule[i].weight = jdoc["schedule"][i]["weight"];
 		}
 	}
 	if ((s = jdoc["ca"]) != NULL)
@@ -1737,11 +1745,10 @@ wshandleRoot(void) {
 	  <h1>Feeder %s</h1>
 	  %s<br>%s%s%s%s
 	  <p>Next dispense: %s</p>
-	  <p>Weight: %3.0f g</p>
+	  <p>Feed in bowl: %3.0f g</p>
 	  <p>Today so far: %3.0f of %3d g</p>
-	  <form method='post' action='/feed' name='Feed'>
-		Dispense grams:&nbsp;<input name='weight' type='number' size='4' value='%d' min='1' max='25'>
-		<input name='Feed' type='submit' value='Feed'>
+	  <form method='post' action='/feed' name='Dispense'>
+		<input name='Dispense' type='submit' value='Dispense Now'>
 	  </form>
 	  <div id='history' style='width:600px; height:300px;'></div>
 	  <p><a href='/config'>System Configuration</a></p>
@@ -1766,7 +1773,6 @@ wshandleRoot(void) {
 	  npState & STATE_OPEN_ERROR ? "<p style='color: #AA0000;'>Door open or limit switch error</p>" : "",
 	  ~npState & STATE_NO_SCHEDULE ? alarm1Date : "No Schedule",
 	  weigh(true), history.day[0].start + nvdata.dispensedTotal, conf.quota,
-	  conf.perFeed,
 	  sec / 86400, hr % 24, min % 60, sec % 60,
 	  AUTO_VERSION
 	);
@@ -1774,7 +1780,6 @@ wshandleRoot(void) {
 	webserver.send(200, "text/html", body);
 	free(body);
 }
-		//"{title: 'Feeding history', ylabel: 'Temperature (F)', showRangeSelector: true});"
 
 void
 wshandleEngineering(void) {
@@ -2216,7 +2221,7 @@ wshandleConfig(void)
 {
 	char	*body, *temp;
 
-	// 8999 characters max body size but (4025+688*7+250)
+	// 8998 characters max body size but (4025+688*7+250)
 	if ((body = (char *)malloc(9091)) == NULL) {
 		debug(true, "WEB / failed to allocate 8800 bytes");
 		return;
@@ -2227,7 +2232,7 @@ wshandleConfig(void)
 		return;
 	}
 	
-	// max 4020 characters.
+	// max 4019 characters.
 	snprintf(body, 4025,
 		"<!doctype html>"
 		"<html lang='en'>\n"
@@ -2250,7 +2255,7 @@ wshandleConfig(void)
 		  "<tr><td width='30%%'>Time Zone spec:</td><td><input name='tz' type='text' value='%s' size='32' maxlength='32'></td></tr>\n"
 		  "<tr><td>&nbsp;</td><td>&nbsp;</td></tr>"
 		  "<tr><td width='30%%'>Daily quota:</td><td><input name='quota' type='number' size='4' value='%d' min='10' max='120'>grams</td></tr>\n"
-		  "<tr><td width='30%%'>Per feed:</td><td><input name='perfeed' type='number' size='4' value='%d' min='1' max='25'>grams</td></tr>\n"
+		  "<tr><td width='30%%'>Max feed in bowl:</td><td><input name='maxfood' type='number' size='4' value='%d' min='1' max='25'>grams</td></tr>\n"
 		  "<tr><td width='30%%'>Close to feed:</td><td><input name='ctf' type='checkbox' value='true' %s></td></tr>\n"
 		  "<tr><td width='30%%'>Dispense cooloff:</td><td><input name='cooloff' type='number' size='4' value='%d' min='0' max='120'> Minutes</td></tr>\n"
 		  "<tr><td>&nbsp;</td><td>&nbsp;</td></tr>"
@@ -2274,7 +2279,7 @@ wshandleConfig(void)
 		  "<tr><td width='30%%'>RO Community:</td><td><input name='snmpro' type='text' value='%s' size='32' maxlength='63'></td></tr>\n"
 		  "<tr><td width='30%%'>RW Community:</td><td><input name='snmprw' type='text' value='%s' size='32' maxlength='63'></td></tr>\n"
 		  "</table><p>\n",
-		  conf.hostname, conf.hostname, conf.hostname, conf.ssid, conf.wpakey, conf.BLEtimeout, conf.ntpserver, conf.timezone, conf.quota, conf.perFeed,
+		  conf.hostname, conf.hostname, conf.hostname, conf.ssid, conf.wpakey, conf.BLEtimeout, conf.ntpserver, conf.timezone, conf.quota, conf.maxFood,
 		  conf.flags & CFG_DISPENSE_CLOSED ? "checked" : "", conf.cooloff,
 		  conf.flags & CFG_NTFY_ENABLE ? "checked" : "", 
 		  conf.flags & CFG_NTFY_PROBLEM ? "checked" : "", 
@@ -2364,9 +2369,9 @@ wshandleSave(void)
 	if (value.length() && value.toInt() >= 10 && value.toInt() <= 120)
 		conf.quota = value.toInt();
 
-	value = webserver.arg("perfeed");
+	value = webserver.arg("maxfood");
 	if (value.length() && value.toInt() >= 1 && value.toInt() <= 25)
-		conf.perFeed = value.toInt();
+		conf.maxFood = value.toInt();
 
 	if (webserver.hasArg("ctf"))
 		conf.flags |= CFG_DISPENSE_CLOSED;
@@ -2548,13 +2553,12 @@ wshandleDoFeed()
 {
 	char	*body;
 	int		 weight = 0;
-	String	 value;
+	float	 dispensed;
 
 	if ((body = (char *)malloc(400)) == NULL)
 		return;
-	value = webserver.arg("weight");
-	if (value.length()&& value.toInt() > 0 && value.toInt() < 60)
-		weight = value.toInt();
+
+	weight = getDispenseWeight(weigh(true));
 
 	snprintf(body, 400,
 	  "<!doctype html>"
@@ -2576,7 +2580,7 @@ wshandleDoFeed()
 	free(body);
 	
 	if (weight) {
-		float dispensed = dispense(weight);
+		dispensed = dispense(weight);
 		nvdata.dispensedTotal += dispensed;
 		saveNvData();
 		if (conf.flags & CFG_NTFY_DISPENSE)
@@ -2714,15 +2718,15 @@ wshandleSchedule(void)
 	for (int i = 0; i < 10; i++) {
 		snprintf(temp, 688,
 		  "<table border=0 width='520' cellspacing=4 cellpadding=0>\n"
-		  "<tr><td width='20%%'><b>Schedule %d:</b></td><td>Enable:<input name='e%d' type='checkbox' value='true' %s>"
-		  "Allow skip:<input name='s%d' type='checkbox' value='true' %s><br></td></tr>\n"
-		  "<tr><td width='20%%'>time:</td><td><input name='t%d' type='time' value='%02d:%02d'></td></tr>\n"
-		  "<tr><td width='20%%'>Weight:</td><td><input name='w%d' type='number' value=%d size=3 min=0 max=25></td></tr>\n"
-		  "</table><p>\n",
-		  i + 1, i, conf.schedule[i].flags & CFG_SCHED_ENABLE ? "checked" : "",
-		  i, conf.schedule[i].flags & CFG_SCHED_SKIP ? "checked" : "",
+		  "<tr><td width='20%%'><b>Schedule %d:</b></td></tr>\n"
+		  "<tr><td width='20%%'>time:</td><td><input name='t%d' type='time' value='%02d:%02d'></td>"
+		  "<td>Enable:<input name='e%d' type='checkbox' value='true' %s>"
+		  "Allow skip:<input name='s%d' type='checkbox' value='true' %s></td></tr>\n"
+		  "</table><p>",
+		  i + 1,
 		  i, conf.schedule[i].hour, conf.schedule[i].minute,
-		  i, conf.schedule[i].weight
+		  i, conf.schedule[i].flags & CFG_SCHED_ENABLE ? "checked" : "",
+		  i, conf.schedule[i].flags & CFG_SCHED_SKIP ? "checked" : ""
 		);
 		strcat(body, temp);
 	}
@@ -2760,11 +2764,6 @@ if ((temp = (char *)malloc(400)) == NULL)
 				conf.schedule[i].minute = m;
 		  }
 		}
-
-		snprintf(temp, 399, "w%d", i);
-		value = webserver.arg(temp);
-		if (value.length() && value.toInt() >= 0 && value.toInt() <= 25)
-			conf.schedule[i].weight = value.toInt();
 
 		snprintf(temp, 399, "e%d", i);
 		if (webserver.hasArg(temp))
