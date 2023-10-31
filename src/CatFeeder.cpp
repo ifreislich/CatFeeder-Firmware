@@ -300,6 +300,7 @@ void saveNvData(void);
 void initNvData(void);
 void saveNvHistory(void);
 void initNvHistory(void);
+void resetNvHistory(void);
 void configToJson(char **);
 int jsonToConfig(const char *);
 uint8_t getNextAlarm(void);
@@ -717,6 +718,16 @@ loop()
 				}
 				Serial.print(text);
 				break;
+			  case 'z':
+				resetNvHistory();
+				text = "History cleared\r\n";
+				if (npState & STATE_BLE_CONNECTED) {
+					pTxCharacteristic->setValue((uint8_t *)text, strlen(text));
+					pTxCharacteristic->notify();
+				}
+				Serial.print(text);
+				saveNvHistory();
+				break;
 			  case '\r':
 			  case '\n':
 			  	break;
@@ -729,7 +740,8 @@ loop()
 				"s: Set SSID\r\n"
 				"p: Set WPA2 PSK\r\n"
 				"w: Write config to NVRAM\r\n"
-				"r: Reboot\r\n";
+				"r: Reboot\r\n"
+				"z: Clear the history\r\n";
 				if (npState & STATE_BLE_CONNECTED) {
 					pTxCharacteristic->setValue((uint8_t *)text, strlen(text));
 					pTxCharacteristic->notify();
@@ -838,7 +850,7 @@ loop()
 		openDoor();
 	// If the door is supposed to be closed but the limit switch doesn't read closed,
 	// Attempt to re-close the door
-	if ((~npState & STATE_OPEN) && (~npState & (STATE_CLOSE_ERROR | STATE_OPEN_ERROR)) && !digitalRead(PIN_CLOSE_LIMIT)) {
+	if ((~npState & STATE_OPEN) && (~npState & STATE_CLOSE_ERROR) && !digitalRead(PIN_CLOSE_LIMIT)) {
 		debug(true, "Door should be closed, reclosing");
 		closeDoor();
 	}
@@ -1129,6 +1141,8 @@ getDispenseWeight(float curWeight)
 		feedWeight = 0;
 	if (history.day[0].start + nvdata.dispensedTotal + feedWeight > conf.quota)
 		feedWeight = conf.quota - (nvdata.dispensedTotal + history.day[0].start);
+	if (feedWeight < 0)	// Can't dispense a negitive weight
+		feedWeight = 0;
 
 	return(feedWeight);
 }
@@ -1193,6 +1207,13 @@ wifiEvent(WiFiEvent_t event)
 }
 
 void
+resetNvHistory(void)
+{
+	memset(&history, '\0', sizeof(struct nvhistory));
+	history.magic = MAGIC;
+}
+
+void
 initNvHistory(void)
 {
 	FastCRC16	 CRC16;
@@ -1207,9 +1228,7 @@ initNvHistory(void)
 	}
 	if (history.magic != MAGIC || history.crc != CRC16.ccitt((uint8_t *)&history, sizeof(struct nvhistory) - 2)) {
 		debug(false, "Resetting history");
-		memset(&history, '\0', sizeof(struct nvhistory));
-		history.magic = MAGIC;
-		history.crc = CRC16.ccitt((uint8_t *)&history, sizeof(struct nvhistory) - 2);
+		resetNvHistory();
 		saveNvHistory();
 	}
 }
