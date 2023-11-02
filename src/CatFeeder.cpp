@@ -791,7 +791,7 @@ loop()
 	if (npState & STATE_RTC_INTR && time(NULL) - lastAuth > VISIT_TIMEOUT) {
 		npState &= ~STATE_RTC_INTR;
 		if (rtc.alarmFired(1)) {
-			uint8_t feedWeight;
+			float	feedWeight;
 			float	curWeight;
 			const char *reason1;
 			const char *reason2;
@@ -804,25 +804,25 @@ loop()
 			curWeight = weigh(true);
 			feedWeight = getDispenseWeight(curWeight);
 			reason1 = time(NULL) < nvdata.skipDispenseUntil ? "Dispense cooloff" : "";
-			reason2 = feedWeight == 0 ? "Target dispense is zero" : "";
+			reason2 = feedWeight < 1e-9 ? "Target dispense is zero" : "";
 
 			if (!((conf.schedule[alarmIdx].flags & CFG_SCHED_SKIP) && (~nvdata.state & NVSTATE_CHECK_HOPPER) && (*reason1 || *reason2))) {
 				dispensed = dispense(feedWeight);
 				nvdata.dispensedTotal += dispensed;
-				debug(true, "Auto-dispense: %3.0fg of %dg Dispensed total: %3.0fg of %dg Next dispense: %02d:%02d",
+				debug(true, "Auto-dispense: %4.1fg of %4.1fg Dispensed total: %4.1fg of %dg Next dispense: %02d:%02d",
 					dispensed, feedWeight, history.day[0].start + nvdata.dispensedTotal, conf.quota, conf.schedule[alarmNextIdx].hour, conf.schedule[alarmNextIdx].minute);
 				if (conf.flags & CFG_NTFY_DISPENSE)
-					ntfy(WiFi.getHostname(), "alarm_clock", 3, "Auto-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg\\nNext dispense: %02d:%02d",
-					  dispensed, feedWeight, nvdata.dispensedTotal, conf.quota, conf.schedule[alarmNextIdx].hour, conf.schedule[alarmNextIdx].minute);
+					ntfy(WiFi.getHostname(), "alarm_clock", 3, "Auto-dispense: %4.1fg of %4.1fg\\nDispensed total: %4.1fg of %dg\\nNext dispense: %02d:%02d",
+					  dispensed, feedWeight, history.day[0].start + nvdata.dispensedTotal, conf.quota, conf.schedule[alarmNextIdx].hour, conf.schedule[alarmNextIdx].minute);
 			}
 			else {
-				debug(true, "Auto-dispense: Skipped. Dispensed total: %3.0fg of %dg Next dispense: %02d:%02d",
+				debug(true, "Auto-dispense: Skipped. Dispensed total: %4.1fg of %dg Next dispense: %02d:%02d",
 					history.day[0].start + nvdata.dispensedTotal, conf.quota, conf.schedule[alarmNextIdx].hour, conf.schedule[alarmNextIdx].minute);
 				if (conf.flags & CFG_NTFY_DISPENSE)
 					ntfy(WiFi.getHostname(), "alarm_clock", 3, "Auto-dispense: Skipped (%s%s%s)\\n"
-					  "Dispensed total: %3.0fg of %dg\\n"
+					  "Dispensed total: %4.1fg of %dg\\n"
 					  "Next dispense: %02d:%02d",
-					  reason1, *reason1 && *reason2 ? ", " : "", reason2, nvdata.dispensedTotal, conf.quota,
+					  reason1, *reason1 && *reason2 ? ", " : "", reason2, history.day[0].start + nvdata.dispensedTotal, conf.quota,
 					  conf.schedule[alarmNextIdx].hour, conf.schedule[alarmNextIdx].minute);
 			}
 			setAlarm(alarmNextIdx); 
@@ -859,9 +859,9 @@ loop()
 	if (npState & STATE_WEIGHTREPORT && time(NULL) - lastAuth > VISIT_TIMEOUT) {
 		float curWeight = weigh(true);
 		if (conf.flags & CFG_NTFY_VISIT)
-			ntfy(WiFi.getHostname(), "balance_scale", 3, "This Feed: %3.0fg\\nConsumed today: %3.0f\\nDispensed total: %3.0fg of %dg",
-			  startWeight - curWeight, history.day[0].start + nvdata.dispensedTotal - curWeight, history.day[0].start +
-			  nvdata.dispensedTotal, conf.quota);
+			ntfy(WiFi.getHostname(), "balance_scale", 3, "This Feed: %4.1fg\\nConsumed today: %4.1fg\\nRemaining in bowl: %4.1fg\\nDispensed total: %4.1fg of %dg",
+			  startWeight - curWeight, history.day[0].start + nvdata.dispensedTotal - curWeight,
+			  curWeight, history.day[0].start + nvdata.dispensedTotal, conf.quota);
 		if (startWeight - curWeight > conf.maxFood / 2.0)
 			nvdata.skipDispenseUntil = time(NULL) + conf.cooloff * 60;
 		startWeight = 0;
@@ -927,7 +927,7 @@ checkCard(uint8_t facilityCode, uint16_t cardCode)
 		if (time(NULL) - lastAuth > VISIT_TIMEOUT) {
 			debug(true, "Authorized: %s", catName(facilityCode, cardCode));
 			if (conf.flags & CFG_NTFY_VISIT)
-				ntfy(WiFi.getHostname(), "plate_with_cutlery", 3, "Authorized: %s\\nStart weight: %3.0fg", catName(facilityCode, cardCode), weigh(true));
+				ntfy(WiFi.getHostname(), "plate_with_cutlery", 3, "Authorized: %s\\nStart weight: %4.1fg", catName(facilityCode, cardCode), weigh(true));
 		}
 		lastAuth = time(NULL);
 	}
@@ -936,7 +936,7 @@ checkCard(uint8_t facilityCode, uint16_t cardCode)
 		dispensed = dispense(weight);
 		nvdata.dispensedTotal += dispensed;
 		if (conf.flags & CFG_NTFY_DISPENSE)
-			ntfy(WiFi.getHostname(), "cook", 3, "Manual-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg", dispensed, weight,
+			ntfy(WiFi.getHostname(), "cook", 3, "Manual-dispense: %4.1fg of %4.1fg\\nDispensed total: %4.1fg of %dg", dispensed, weight,
 				history.day[0].start + nvdata.dispensedTotal, conf.quota);
 	}
 	else { // Unknown cat
@@ -1038,7 +1038,7 @@ dispense(float grams)
 		return(0);
 	}
 
-	debug(true, "Dispense %4.2f", grams);
+	debug(true, "Dispense %4.1fg", grams);
 	if (conf.flags & CFG_DISPENSE_CLOSED)
 		closeDoor();
 	enableAuger();
@@ -1735,6 +1735,7 @@ wshandleRoot(void) {
 	char		 alarm1Date[9] = "hh:mm";
 	time_t		 t = time(NULL);
 	struct tm	*tm = localtime(&t);
+	float		 weight;
 
 	strftime(timestr, 20, "%F %T", tm);
 
@@ -1746,6 +1747,7 @@ wshandleRoot(void) {
 		DateTime alarm1 = rtc.getAlarm1() + getTz();
 		alarm1.toString(alarm1Date);
 	}
+	weight = weigh(true);
 	snprintf(body, 2048,
 	  R"(<!doctype html>
 	  <html lang='en'>
@@ -1764,8 +1766,9 @@ wshandleRoot(void) {
 	  <h1>Feeder %s</h1>
 	  %s<br>%s%s%s%s
 	  <p>Next dispense: %s</p>
-	  <p>Feed in bowl: %3.0f g</p>
-	  <p>Today so far: %3.0f of %3d g</p>
+	  <p>Feed in bowl: %4.1f g</p>
+	  <p>Feed consumed: %4.1f g</p>
+	  <p>Dispensed so far: %4.1f of %3d g</p>
 	  <form method='post' action='/feed' name='Dispense'>
 		<input name='Dispense' type='submit' value='Dispense Now'>
 	  </form>
@@ -1791,7 +1794,7 @@ wshandleRoot(void) {
 	  npState & STATE_CLOSE_ERROR ? "<p style='color: #AA0000;'>Door close or limit switch error</p>" : "",
 	  npState & STATE_OPEN_ERROR ? "<p style='color: #AA0000;'>Door open or limit switch error</p>" : "",
 	  ~npState & STATE_NO_SCHEDULE ? alarm1Date : "No Schedule",
-	  weigh(true), history.day[0].start + nvdata.dispensedTotal, conf.quota,
+	  weight, history.day[0].start + nvdata.dispensedTotal - weight, history.day[0].start + nvdata.dispensedTotal, conf.quota,
 	  sec / 86400, hr % 24, min % 60, sec % 60,
 	  AUTO_VERSION
 	);
@@ -2571,7 +2574,7 @@ void
 wshandleDoFeed()
 {
 	char	*body;
-	int		 weight = 0;
+	float	 weight;
 	float	 dispensed;
 
 	if ((body = (char *)malloc(400)) == NULL)
@@ -2598,12 +2601,13 @@ wshandleDoFeed()
 	webserver.send(200, "text/html", body);
 	free(body);
 	
-	if (weight) {
+	if (weight > 1e-9) {
 		dispensed = dispense(weight);
 		nvdata.dispensedTotal += dispensed;
 		saveNvData();
 		if (conf.flags & CFG_NTFY_DISPENSE)
-			ntfy(WiFi.getHostname(), "desktop_computer", 3, "Web-dispense: %3.0fg of %dg\\nDispensed total: %3.0fg of %dg", dispensed, weight, nvdata.dispensedTotal, conf.quota);
+			ntfy(WiFi.getHostname(), "desktop_computer", 3, "Web-dispense: %4.1fg of %4.1fg\\nDispensed total: %4.1fg of %dg",
+			  dispensed, weight, history.day[0].start + nvdata.dispensedTotal, conf.quota);
 	}
 }
 
