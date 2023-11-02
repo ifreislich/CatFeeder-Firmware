@@ -2592,7 +2592,7 @@ wshandleDoFeed()
 	  "</head>\n"
 	  "<body>\n"
 	  "<h1>Feeder %s</h1>"
-	  "Dispensing %d g"
+	  "Dispensing %4.1f g"
 	  "<meta http-equiv='Refresh' content='3; url=/'>"
 	  "</body>\n"
 	  "</html>", conf.hostname, conf.hostname, weight);
