@@ -129,6 +129,7 @@ struct nvhistory {
 #define CFG_DOOR_MOTOR_SLOW	0x0400
 #define CFG_NTFY_AUTH		0x0800
 #define CFG_NTFY_NOTICE		0x1000
+#define CFG_NTFY_DEBUG		0x2000
 
 #define CFG_CAT_ACCESS		0x01
 #define CFG_CAT_DISPENSE	0x02
@@ -926,7 +927,7 @@ checkCard(uint8_t facilityCode, uint16_t cardCode)
 			openDoor();
 		if (time(NULL) - lastAuth > VISIT_TIMEOUT) {
 			debug(true, "Authorized: %s", catName(facilityCode, cardCode));
-			if (conf.flags & CFG_NTFY_VISIT)
+			if (conf.flags & CFG_NTFY_DEBUG)
 				ntfy(WiFi.getHostname(), "plate_with_cutlery", 3, "Authorized: %s\\nStart weight: %4.1fg", catName(facilityCode, cardCode), weigh(true));
 		}
 		lastAuth = time(NULL);
@@ -1343,7 +1344,7 @@ void
 initConfig(void)
 {
 	FastCRC16	 CRC16;
-	uint32_t	 clock;
+	uint32_t	 clock = 0;
 
 	if (npState & STATE_FRAM_PRESENT) {
 		if ((clock = Wire.getClock()) > 0)
@@ -1658,11 +1659,11 @@ ntfy(const char *title, const char *tags, const uint8_t priority, const char *fo
 		return;
 
 	if ((buffer = (char *)malloc(3072)) == NULL) {
-		debug(true, "NTFY failed to allocate memory");
+		debug(true, "NTFY failed to allocate 3072 bytes");
 		return;
 	}
 	if ((message = (char *)malloc(2048)) == NULL) {
-		debug(true, "NTFY failed to allocate memory");
+		debug(true, "NTFY failed to allocate 2048 bytes");
 		free(buffer);
 		return;
 	}
@@ -1696,7 +1697,7 @@ ntfy(const char *title, const char *tags, const uint8_t priority, const char *fo
 		free(message);
 		free(buffer);
 		return;
-	} 
+	}
 	wlen = esp_http_client_write(client, buffer, content_length);
 	if (wlen < 0) {
 		debug(true, "Write failed");
@@ -1740,7 +1741,7 @@ wshandleRoot(void) {
 	strftime(timestr, 20, "%F %T", tm);
 
 	if ((body = (char *)malloc(2048)) == NULL) {
-		debug(true, "WEB / failed to allocate memory");
+		debug(true, "WEB / failed to allocate 2048 bytes");
 		return;
 	}
 	if (~npState & STATE_NO_SCHEDULE) {
@@ -1808,7 +1809,7 @@ wshandleEngineering(void) {
 	char		*body;
 
 	if ((body = (char *)malloc(2048)) == NULL) {
-		debug(true, "WEB / failed to allocate memory");
+		debug(true, "WEB / failed to allocate 2048 bytes");
 		return;
 	}
 	snprintf(body, 2048,
@@ -1859,7 +1860,7 @@ wshandleSSL()
 	char		*body;
 
 	if ((body = (char *)malloc(MAX_CERT+450)) == NULL) {
-		debug(true, "WEB / failed to allocate memory");
+		debug(true, "WEB / failed to allocate %d bytes", MAX_CERT + 450);
 		return;
 	}
 	// 437 excluding certificate text
@@ -1893,7 +1894,7 @@ wshandleReboot()
 	char	*body;
 
 	if ((body = (char *)malloc(400)) == NULL) {
-		debug(true, "WEB / failed to allocate memory");
+		debug(true, "WEB / failed to allocate 400 bytes");
 		return;
 	}
 	snprintf(body, 400,
@@ -1967,7 +1968,7 @@ wshandleMaintenance(void)
 	char	*body;
 
 	if ((body = (char *)malloc(1150)) == NULL) {
-		debug(true, "WEB / failed to allocate memory");
+		debug(true, "WEB / failed to allocate 1150 bytes");
 		return;
 	}
 	// 1135 bytes max
@@ -2026,7 +2027,7 @@ wshandleUploadResult(void)
 {
 	char	*body;
 	if ((body = (char *)malloc(500)) == NULL) {
-		debug(true, "WEB / failed to allocate memory");
+		debug(true, "WEB / failed to allocate 500 bytes");
 		return;
 	}
 	snprintf(body, 500,
@@ -2129,7 +2130,7 @@ wsFirmwareUpdateResult(void)
 	char	*body;
 
 	if ((body = (char *)malloc(600)) == NULL) {
-		debug(true, "WEB / failed to allocate memory");
+		debug(true, "WEB / failed to allocate 600 bytes");
 		return;
 	}
 
@@ -2213,7 +2214,7 @@ wshandleNVHistory(void)
 	struct tm	*tm;
 
 	if ((body = (char *)malloc(11712)) == NULL) {
-		debug(true, "WEB / failed to allocate 8800 bytes");
+		debug(true, "WEB / failed to allocate 11712 bytes");
 		return;
 	}
 
@@ -2245,7 +2246,7 @@ wshandleConfig(void)
 
 	// 8998 characters max body size but (4025+688*7+250)
 	if ((body = (char *)malloc(9091)) == NULL) {
-		debug(true, "WEB / failed to allocate 8800 bytes");
+		debug(true, "WEB / failed to allocate 9091 bytes");
 		return;
 	}
 	if ((temp = (char *)malloc(690)) == NULL) {
@@ -2289,6 +2290,7 @@ wshandleConfig(void)
 		  	"<tr><td><input name='ntfy-vist' type='checkbox' value='true' %s>Visits</td></tr>"
 		  	"<tr><td><input name='ntfy-ntrd' type='checkbox' value='true' %s>Intruder</td></tr>"
 			"<tr><td><input name='ntfy-info' type='checkbox' value='true' %s>Info</td></tr>"
+			"<tr><td><input name='ntfy-debug' type='checkbox' value='true' %s>Debug</td></tr>"
 			"</table>"
 		  	"</td></tr>\n"
 		  "<tr><td width='30%%'>Service URL:</td><td><input name='url' type='url' value='%s' size='32' maxlength='63'></td></tr>\n"
@@ -2309,6 +2311,7 @@ wshandleConfig(void)
 		  conf.flags & CFG_NTFY_VISIT ? "checked" : "", 
 		  conf.flags & CFG_NTFY_INTRUDE ? "checked" : "", 
 		  conf.flags & CFG_NTFY_NOTICE ? "checked" : "",
+		  conf.flags & CFG_NTFY_DEBUG ? "checked" : "",
 		  conf.ntfy.url, conf.ntfy.topic,
 		  conf.flags & CFG_NTFY_AUTH ? "checked" : "",
 		  conf.ntfy.username, conf.ntfy.password,
@@ -2439,6 +2442,11 @@ wshandleSave(void)
 	else
 		conf.flags &= ~CFG_NTFY_NOTICE;
 
+	if (webserver.hasArg("ntfy-debug"))
+		conf.flags |= CFG_NTFY_DEBUG;
+	else
+		conf.flags &= ~CFG_NTFY_DEBUG;
+
 	if (webserver.hasArg("url")) {
 		value = webserver.arg("url");
 		strncpy(conf.ntfy.url, value.c_str(), 64);
@@ -2541,7 +2549,7 @@ wshandleSaveSSL()
 	char		*body;
 
 	if ((body = (char *)malloc(400)) == NULL) {
-		debug(true, "WEB / failed to allocate memory");
+		debug(true, "WEB / failed to allocate 400 bytes");
 		return;
 	}
 	if (webserver.hasArg("cacrt")) {
