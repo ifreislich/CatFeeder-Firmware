@@ -422,10 +422,8 @@ setup()
 	rtc.setAlarm2(alarm2 - getTz(), DS3231_A2_Hour);
 	if (npState & STATE_GOT_TIME)
 		setAlarm(getNextAlarm());
-	else {
+	else
 		npState |= STATE_NO_SCHEDULE;
-		rtc.disableAlarm(1);
-	}
 	pinMode(PIN_RTC_INTR, INPUT_PULLUP);
 
 	pinMode(PIN_AUGER_EN, OUTPUT);
@@ -791,7 +789,7 @@ loop()
 
 	if (npState & STATE_RTC_INTR && time(NULL) - lastAuth > VISIT_TIMEOUT) {
 		npState &= ~STATE_RTC_INTR;
-		if (rtc.alarmFired(1)) {
+		if (~npState & STATE_NO_SCHEDULE && rtc.alarmFired(1)) {
 			float	feedWeight;
 			float	curWeight;
 			const char *reason1;
@@ -1549,7 +1547,6 @@ setAlarm(uint8_t alarm)
 {
 	if (alarm >= CFG_NSCHEDULES) {
 		npState |= STATE_NO_SCHEDULE;
-		rtc.disableAlarm(1);
 		return;
 	}
 	npState &= ~STATE_NO_SCHEDULE;
