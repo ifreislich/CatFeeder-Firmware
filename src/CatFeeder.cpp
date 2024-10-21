@@ -1371,12 +1371,12 @@ initConfig(void)
 void
 configToJson(char **sDoc)
 {
-	DynamicJsonDocument		jdoc(2048 + MAX_CERT);
-	DynamicJsonDocument		jntfy(1024);
-	DynamicJsonDocument		jcats(1024);
-	DynamicJsonDocument		jschedules(2048);
-	int						len;
-	char					flags[11];
+	JsonDocument		jdoc;
+	JsonDocument		jntfy;
+	JsonDocument		jcats;
+	JsonDocument		jschedules;
+	int					len;
+	char				flags[11];
 
 	jdoc["hostname"] = conf.hostname;
 	jdoc["cal-factor"] = conf.scale;
@@ -1399,7 +1399,7 @@ configToJson(char **sDoc)
 	jdoc["snmpro"] = conf.snmpro;
 	jdoc["snmprw"] = conf.snmprw;
 	for (int i = 0; i < CFG_NCATS; i++) {
-		StaticJsonDocument<100>	jcat;
+		JsonDocument	jcat;
 		jcat["name"] = conf.cat[i].name;
 		snprintf(flags, 11, "0x%04x", conf.cat[i].flags);
 		jcat["flags"] = flags;
@@ -1409,7 +1409,7 @@ configToJson(char **sDoc)
 	}
 	jdoc["cats"] = jcats;
 	for (int i = 0; i < CFG_NSCHEDULES; i++) {
-		StaticJsonDocument<100>	jsched;
+		JsonDocument	jsched;
 		snprintf(flags, 11, "0x%02x", conf.schedule[i].flags);
 		jsched["flags"] = flags;
 		jsched["hour"] = conf.schedule[i].hour;
@@ -1427,7 +1427,7 @@ configToJson(char **sDoc)
 int
 jsonToConfig(const char *sDoc)
 {
-	DynamicJsonDocument		 jdoc(2048 + MAX_CERT);
+	JsonDocument		 	 jdoc;
 	DeserializationError	 err;
 	const char				*s;
 	char					*p;
@@ -1437,9 +1437,9 @@ jsonToConfig(const char *sDoc)
 		return(1);
 	}
 
-	if (jdoc.containsKey("cal-factor"))
+	if (jdoc["cal-factor"])
 		conf.scale = jdoc["cal-factor"];
-	if (jdoc.containsKey("cal-offset"))
+	if (jdoc["cal-offset"])
 		conf.offset = jdoc["cal-offset"];
 	if ((s = jdoc["hostname"]) != NULL)
 		strncpy(conf.hostname, s, 32);
@@ -1447,19 +1447,19 @@ jsonToConfig(const char *sDoc)
 		strncpy(conf.ssid, s, 64);
 	if ((s = jdoc["wpakey"]) != NULL)
 		strncpy(conf.wpakey, s, 64);
-	if (jdoc.containsKey("BLEtimeout"))
+	if (jdoc["BLEtimeout"])
 		conf.BLEtimeout = jdoc["BLEtimeout"];
 	if ((s = jdoc["ntpserver"]) != NULL)
 		strncpy(conf.ntpserver, s, 64);
-	if (jdoc.containsKey("quota"))
+	if (jdoc["quota"])
 		conf.quota = jdoc["quota"];
-	if (jdoc.containsKey("maxFood"))
+	if (jdoc["maxFood"])
 		conf.maxFood = jdoc["maxFood"];
-	if (jdoc.containsKey("cooloff"))
+	if (jdoc["cooloff"])
 		conf.cooloff = jdoc["cooloff"];
 	if ((s = jdoc["flags"]) != NULL)
 		conf.flags = strtoul(s, &p, 0);
-	if (jdoc.containsKey("ntfy")) {
+	if (jdoc["ntfy"]) {
 		if ((s = jdoc["ntfy"]["password"]) != NULL)
 			strncpy(conf.ntfy.password, s, 16);
 		if ((s = jdoc["ntfy"]["username"]) != NULL)
@@ -1473,25 +1473,25 @@ jsonToConfig(const char *sDoc)
 		strncpy(conf.snmpro, s, 64);
 	if ((s = jdoc["snmprw"]) != NULL)
 		strncpy(conf.snmprw, s, 64);
-	if (jdoc.containsKey("cats")) {
+	if (jdoc["cats"]) {
 		for (int i = 0; i < jdoc["cats"].size() && i < CFG_NCATS; i++) {
 			if ((s = jdoc["cats"][i]["name"]) != NULL)
 				strncpy(conf.cat[i].name, s, 20);
 			if ((s = jdoc["cats"][i]["flags"]) != NULL)
 				conf.cat[i].flags = strtoul(s, &p, 0);
-			if (jdoc["cats"][i].containsKey("facility"))
+			if (jdoc["cats"][i]["facility"])
 				conf.cat[i].facility = jdoc["cats"][i]["facility"];
-			if (jdoc["cats"][i].containsKey("id"))
+			if (jdoc["cats"][i]["id"])
 				conf.cat[i].id = jdoc["cats"][i]["id"];
 		}
 	}
-	if (jdoc.containsKey("schedule")) {
+	if (jdoc["schedule"]) {
 		for (int i = 0; i < jdoc["schedule"].size() && i < CFG_NSCHEDULES; i++) {
 			if ((s = jdoc["schedule"][i]["flags"]) != NULL)
 				conf.schedule[i].flags = strtoul(s, &p, 0);
-			if (jdoc["schedule"][i].containsKey("hour"))
+			if (jdoc["schedule"][i]["hour"])
 				conf.schedule[i].hour = jdoc["schedule"][i]["hour"];
-			if (jdoc["schedule"][i].containsKey("minute"))
+			if (jdoc["schedule"][i]["minute"])
 				conf.schedule[i].minute = jdoc["schedule"][i]["minute"];
 		}
 	}
