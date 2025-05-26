@@ -99,7 +99,7 @@ struct nvdata {
 	uint32_t	magic;
 	uint32_t	state;
 	float		dispensedTotal;
-	time_t		skipDispenseUntil;
+	time_t		lastDispense;
 	uint8_t		pad[32];
 	uint16_t	crc;
 } __attribute__((__packed__));
@@ -163,7 +163,7 @@ struct nvhistory {
 #define PIN_DATA1			26
 #define WEIGAND_TIMEOUT		20	// timeout in ms on Wiegand sequence 
 #define DOOR_TIMEOUT		60	// Door stays locked for max X seconds
-#define SETTLING_TIME		3
+#define SETTLING_TIME		3	// Allow the weight to settle before opening
 #define VISIT_TIMEOUT		180 // End visitation when the last card read is 180s ago
 
 #define PIN_RTC_INTR		19
@@ -214,7 +214,7 @@ extern const char favicon_end[] asm("_binary_src_favicon_ico_end");
 volatile uint64_t		databits;	// stores all of the data bits
 volatile unsigned char	bitCount;	// number of bits currently captured
 
-time_t					 openAfter = 0, lastAuth = 0, bootTime;
+time_t					 openAfter = 0, lastAuth = 0, bootTime = 0;
 float					 startWeight = 0;
 volatile struct nvdata	 nvdata;	// Non-peristent state
 volatile uint32_t		 npState;
@@ -662,7 +662,7 @@ loop()
 			  case 'f':
 				nvdata.dispensedTotal = 0;
 				npState &= STATE_OPEN | STATE_MENU_SELECT;
-				nvdata.skipDispenseUntil = time(NULL);
+				nvdata.lastDispense = time(NULL) - conf.cooloff * 60;
 				nvdata.magic = MAGIC;
 				defaultSettings();
 				text = "Config and persistent data cleared. Rebooting...\r\n";
@@ -802,7 +802,7 @@ loop()
 
 			curWeight = weigh(true);
 			feedWeight = getDispenseWeight(curWeight);
-			reason1 = time(NULL) < nvdata.skipDispenseUntil ? "Dispense cooloff" : "";
+			reason1 = time(NULL) < nvdata.lastDispense + conf.cooloff ? "Dispense cooloff" : "";
 			reason2 = feedWeight < 1e-9 ? "Target dispense is zero" : "";
 
 			if (!((conf.schedule[alarmIdx].flags & CFG_SCHED_SKIP) && (~nvdata.state & NVSTATE_CHECK_HOPPER) && (*reason1 || *reason2))) {
@@ -862,7 +862,7 @@ loop()
 			  startWeight - curWeight, history.day[0].start + nvdata.dispensedTotal - curWeight,
 			  curWeight, history.day[0].start + nvdata.dispensedTotal, conf.quota);
 		if (startWeight - curWeight > conf.maxFood / 2.0)
-			nvdata.skipDispenseUntil = time(NULL) + conf.cooloff * 60;
+			nvdata.lastDispense = time(NULL);
 		startWeight = 0;
 		npState &= ~STATE_WEIGHTREPORT;
 		saveNvData();
@@ -1033,7 +1033,7 @@ dispense(float grams)
 	float	 startWeight = weigh(true), curWeight;
 
 	// Override cooloff period if the last dispense didn't fully succeed
-	if (~nvdata.state & NVSTATE_CHECK_HOPPER && (time(NULL) < nvdata.skipDispenseUntil)) {
+	if (~nvdata.state & NVSTATE_CHECK_HOPPER && (time(NULL) < nvdata.lastDispense + conf.cooloff * 60)) {
 		return(0);
 	}
 
@@ -1076,7 +1076,7 @@ dispense(float grams)
 		if (conf.flags & CFG_NTFY_PROBLEM)
 			ntfy(WiFi.getHostname(), "warning", 4, "Check Hopper");
 	}
-	nvdata.skipDispenseUntil = time(NULL) + conf.cooloff * 60;
+	nvdata.lastDispense = time(NULL);
 	return(curWeight - startWeight);
 }
 
@@ -1169,7 +1169,7 @@ ntpCallBack(struct timeval *tv)
 {
 	DateTime	 now(tv->tv_sec);
 	
-	if (~npState & STATE_GOT_TIME) {
+	if (bootTime == 0 && ~npState & STATE_GOT_TIME) {
 		setAlarm(getNextAlarm());
 		bootTime = tv->tv_sec - millis() / 1000;
 	}
@@ -1266,7 +1266,7 @@ initNvData(void)
 		debug(false, "Resetting persistent records");
 		nvdata.dispensedTotal = 0;
 		nvdata.state = 0;
-		nvdata.skipDispenseUntil = time(NULL);
+		nvdata.lastDispense = time(NULL) - conf.cooloff * 60;
 		nvdata.magic = MAGIC;
 		memset((void *)nvdata.pad, '\0', sizeof(nvdata.pad));
 		saveNvData();
@@ -1725,7 +1725,7 @@ ntfy(const char *title, const char *tags, const uint8_t priority, const char *fo
 
 void
 wshandleRoot(void) {
-	char		*body;
+	WiFiClient client = webserver.client();
 	char		 timestr[20];
 	int			 sec = time(NULL) - bootTime;
 	int			 min = sec / 60;
@@ -1737,16 +1737,13 @@ wshandleRoot(void) {
 
 	strftime(timestr, 20, "%F %T", tm);
 
-	if ((body = (char *)malloc(2048)) == NULL) {
-		debug(true, "WEB / failed to allocate 2048 bytes");
-		return;
-	}
 	if (~npState & STATE_NO_SCHEDULE) {
 		DateTime alarm1 = rtc.getAlarm1() + getTz();
 		alarm1.toString(alarm1Date);
 	}
 	weight = weigh(true);
-	snprintf(body, 2048,
+	client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\ncache-control: no-store\r\n\r\n");
+	client.printf(
 	  R"(<!doctype html>
 	  <html lang='en'>
 	  <head>
@@ -1796,21 +1793,15 @@ wshandleRoot(void) {
 	  sec / 86400, hr % 24, min % 60, sec % 60,
 	  AUTO_VERSION
 	);
-	webserver.sendHeader("cache-control", "no-store", false);
-	webserver.send(200, "text/html", body);
-	free(body);
+	client.stop();
 }
 
 void
 wshandleEngineering(void) {
-	char		*body;
+	WiFiClient client = webserver.client();
 
-	if ((body = (char *)malloc(2048)) == NULL) {
-		debug(true, "WEB / failed to allocate 2048 bytes");
-		return;
-	}
-	snprintf(body, 2048,
-	  "<!doctype html>"
+	client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\ncache-control: no-store\r\n\r\n");
+	client.printf("<!doctype html>"
 	  "<html lang='en'>"
 	  "<head>"
 	  "<title>Feeder [%s]</title>"
@@ -1846,23 +1837,16 @@ wshandleEngineering(void) {
 	  nvdata.dispensedTotal,
 	  sizeof(struct cfg)
 	);
-	webserver.sendHeader("cache-control", "no-store", false);
-	webserver.send(200, "text/html", body);
-	free(body);
+	client.stop();
 }
 
 void
 wshandleSSL()
 {
-	char		*body;
+	WiFiClient client = webserver.client();
 
-	if ((body = (char *)malloc(MAX_CERT+450)) == NULL) {
-		debug(true, "WEB / failed to allocate %d bytes", MAX_CERT + 450);
-		return;
-	}
-	// 437 excluding certificate text
-	snprintf(body, MAX_CERT+450,
-	  "<!doctype html>"
+	client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\ncache-control: no-store\r\n\r\n");
+	client.printf("<!doctype html>"
 	  "<html lang='en'>"
 	  "<head>"
 	  "<title>Feeder [%s]</title>"
@@ -1880,22 +1864,16 @@ wshandleSSL()
 	  conf.hostname, conf.hostname, MAX_CERT, conf.cacrt
 	);
 
-	webserver.sendHeader("cache-control", "no-store", false);
-	webserver.send(200, "text/html", body);
-	free(body);
+	client.stop();
 }
 
 void
 wshandleReboot()
 {
-	char	*body;
+	WiFiClient client = webserver.client();
 
-	if ((body = (char *)malloc(400)) == NULL) {
-		debug(true, "WEB / failed to allocate 400 bytes");
-		return;
-	}
-	snprintf(body, 400,
-	  "<!doctype html>"
+	client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\ncache-control: no-store\r\n\r\n");
+	client.printf("<!doctype html>"
 	  "<html lang='en'>\n"
 	  "<head>\n"
 	  "<title>Feeder [%s]</title>\n"
@@ -1909,9 +1887,7 @@ wshandleReboot()
 	  "</body>\n"
 	  "</html>", conf.hostname, conf.hostname);
 	  
-	webserver.sendHeader("cache-control", "no-store", false);
-	webserver.send(200, "text/html", body);
-	free(body);
+	client.stop();
 	delay(100);
 	NimBLEDevice::deinit();
 	ESP.restart();
@@ -1962,15 +1938,10 @@ wshandleDygraphCSS(void)
 void
 wshandleMaintenance(void)
 {
-	char	*body;
+	WiFiClient client = webserver.client();
 
-	if ((body = (char *)malloc(1150)) == NULL) {
-		debug(true, "WEB / failed to allocate 1150 bytes");
-		return;
-	}
-	// 1135 bytes max
-	snprintf(body, 1150,
-	R"(<!DOCTYPE html>
+	client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\ncache-control: no-store\r\n\r\n");
+	client.printf(R"(<!DOCTYPE html>
 	<html lang='en'>
 	<head>
 		<meta charset='utf-8'>
@@ -2000,9 +1971,7 @@ wshandleMaintenance(void)
 	conf.hostname, conf.hostname,
 	conf.flags & CFG_ENGINEERING ? "<p><a href='/engineering'>Engineering options</a></p>" : "");
 
-	webserver.sendHeader("cache-control", "public, max-age=86400", false);
-	webserver.send(200, "text/html", body);
-	free(body);
+	client.stop();
 }
 
 void
@@ -2022,13 +1991,10 @@ wshandleDownloadConfig(void)
 void
 wshandleUploadResult(void)
 {
-	char	*body;
-	if ((body = (char *)malloc(500)) == NULL) {
-		debug(true, "WEB / failed to allocate 500 bytes");
-		return;
-	}
-	snprintf(body, 500,
-	"<!doctype html>"
+	WiFiClient client = webserver.client();
+
+	client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\ncache-control: no-store\r\n\r\n");
+	client.printf("<!doctype html>"
 	"<html lang='en'>\n"
 	"<head>\n"
 	"<title>Feeder [%s]</title>\n"
@@ -2044,9 +2010,7 @@ wshandleUploadResult(void)
 	npState & STATE_JSON_ERROR ? "Error reading configuration" : "Configuration updated.<br>Check System and schedules.<br>Save to commit."
 	);
 
-	webserver.sendHeader("cache-control", "no-store", false);
-	webserver.send(200, "text/html", body);
-	free(body);
+	client.stop();
 	npState &= ~STATE_JSON_ERROR;
 }
 
@@ -2197,7 +2161,7 @@ wshandleGraphData(void)
 	}
 
 	webserver.sendHeader("cache-control", "no-store", false);
-	webserver.send_P(200, "text/plain", body);
+	webserver.send(200, "text/plain", body);
 	free(body);
 }
 
@@ -2232,29 +2196,17 @@ wshandleNVHistory(void)
 	}
 
 	webserver.sendHeader("cache-control", "no-store", false);
-	webserver.send_P(200, "text/plain", body);
+	webserver.send(200, "text/plain", body);
 	free(body);
 }
 
 void
 wshandleConfig(void)
 {
-	char	*body, *temp;
+	WiFiClient client = webserver.client();
 
-	// 8998 characters max body size but (4025+688*7+250)
-	if ((body = (char *)malloc(9091)) == NULL) {
-		debug(true, "WEB / failed to allocate 9091 bytes");
-		return;
-	}
-	if ((temp = (char *)malloc(690)) == NULL) {
-		debug(true, "WEB / failed to allocate 690 bytes");
-		free(body);
-		return;
-	}
-	
-	// max 4019 characters.
-	snprintf(body, 4025,
-		"<!doctype html>"
+	client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\ncache-control: no-store\r\n\r\n");
+	client.printf("<!doctype html>"
 		"<html lang='en'>\n"
 		"<head>\n"
 		"<title>Feeder [%s]</title>\n"
@@ -2314,10 +2266,8 @@ wshandleConfig(void)
 		  conf.ntfy.username, conf.ntfy.password,
 		  conf.flags & CFG_SNMP_ENABLE ? "checked" : "", conf.snmpro, conf.snmprw);
 
-	// max 679 characters per cat
 	for (int i = 0; i < CFG_NCATS; i++) {
-		snprintf(temp, 688,
-		  "<table border=0 width='520' cellspacing=4 cellpadding=0>\n"
+		client.printf("<table border=0 width='520' cellspacing=4 cellpadding=0>\n"
 		  "<tr><td width='30%%'><b>Cat %d:</b></td><td><input name='catname%d' type='text' value='%s' size='19' maxlength='19'></td></tr>\n"
 		  "<tr><td width='30%%'>Facility Code:</td><td><input name='facility%d' type='number' size='4' value='%d' min='0' max='255'></td></tr>\n"
 		  "<tr><td width='30%%'>Tag ID:</td><td><input name='id%d' type='number' size='4' value='%d' min='0' max='8191'></td></tr>\n"
@@ -2327,20 +2277,13 @@ wshandleConfig(void)
 		  i + 1, i, conf.cat[i].name, i, conf.cat[i].facility, i, conf.cat[i].id, i, conf.cat[i].flags & CFG_CAT_ACCESS ? "checked" : "",
 		  i, conf.cat[i].flags & CFG_CAT_DISPENSE ? "checked" : ""
 		);
-		strcat(body, temp);
 	}
-	// 239 characters
-	snprintf(temp, 250,
-	  "<input name='Save' type='submit' value='Save'>"
+	client.printf("<input name='Save' type='submit' value='Save'>"
 	  "</form>"
 	  "<br>"
 	  "</body>"
 	  "</html>");
-	strcat(body, temp);
-	free(temp);
-	webserver.sendHeader("cache-control", "no-store", false);
-	webserver.send_P(200, "text/html", body);
-	free(body);
+	client.stop();
 }
 
 void
@@ -2551,7 +2494,7 @@ wshandleSaveSSL()
 	}
 	if (webserver.hasArg("cacrt")) {
 		value = webserver.arg("cacrt");
-		strncpy(conf.cacrt, value.c_str(), 6144);
+		strncpy(conf.cacrt, value.c_str(), MAX_CERT);
 	}
 
 	snprintf(body, 400,
