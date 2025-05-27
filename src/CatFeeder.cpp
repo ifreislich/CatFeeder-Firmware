@@ -214,10 +214,10 @@ extern const char favicon_end[] asm("_binary_src_favicon_ico_end");
 volatile uint64_t		databits;	// stores all of the data bits
 volatile unsigned char	bitCount;	// number of bits currently captured
 
-time_t					 openAfter = 0, lastAuth = 0, bootTime = 0;
+time_t					 openAfter = 0, lastAuth = 0, bootTime = 0, motionError = 0;
 float					 startWeight = 0;
-volatile struct nvdata	 nvdata;	// Non-peristent state
-volatile uint32_t		 npState;
+volatile struct nvdata	 nvdata;	// Peristent data
+volatile uint32_t		 npState;	// Non-peristent state
 struct cfg				 conf;
 struct nvhistory		 history;
 hw_timer_t				*timer;
@@ -971,11 +971,16 @@ closeDoor(void)
 	if (digitalRead(PIN_CLOSE_LIMIT) && ~npState & STATE_OPEN)
 		return;
 	if (npState & STATE_CLOSE_ERROR) {
-		npState &= ~STATE_OPEN;
-		debug(true, "Door motion disabled due to previously detected error");
-		if (conf.flags & CFG_NTFY_PROBLEM)
-			ntfy(WiFi.getHostname(), "warning", 5, "Door motion disabled due to previously detected error");
-		return;
+		if (time(NULL) < motionError + 1200) {
+			npState &= ~STATE_OPEN;
+			debug(true, "Door motion disabled due to previously detected error");
+			if (conf.flags & CFG_NTFY_PROBLEM)
+				ntfy(WiFi.getHostname(), "warning", 5, "Door motion disabled due to previously detected error");
+			return;
+		}
+		else {
+			npState &= ~STATE_CLOSE_ERROR;
+		}
 	}
 	debug(true, "Closing");
 	digitalWrite(PIN_DOOR_DIR, DOOR_DIR_CLOSE);
@@ -987,9 +992,10 @@ closeDoor(void)
 	}
 	if (i == 3000 && !digitalRead(PIN_CLOSE_LIMIT)) {
 		npState |= STATE_CLOSE_ERROR;
-		debug(true, "Limit switch did not trigger while closing. Motion is disabled until reboot.");
+		motionError = time(NULL);
+		debug(true, "Limit switch did not trigger while closing. Motion is disabled for 20 minutes.");
 		if (conf.flags & CFG_NTFY_PROBLEM)
-			ntfy(WiFi.getHostname(), "warning", 5, "Limit switch did not trigger while closing.\\nMotion is disabled until reboot.");
+			ntfy(WiFi.getHostname(), "warning", 5, "Limit switch did not trigger while closing.\\nMotion is disabled for 20 minutes.");
 	}
 	shutdownDoor();
 	npState &= ~STATE_OPEN;
@@ -1001,11 +1007,16 @@ openDoor(void)
 	int i;
 
 	if (npState & STATE_OPEN_ERROR) {
-		npState |= STATE_OPEN;
-		debug(true, "Door motion disabled due to previously detected error");
-		if (conf.flags & CFG_NTFY_PROBLEM)
-			ntfy(WiFi.getHostname(), "warning", 5, "Door motion disabled due to previously detected error");
-		return;
+		if (time(NULL) < motionError + 1200) {
+			npState |= STATE_OPEN;
+			debug(true, "Door motion disabled due to previously detected error");
+			if (conf.flags & CFG_NTFY_PROBLEM)
+				ntfy(WiFi.getHostname(), "warning", 5, "Door motion disabled due to previously detected error");
+			return;
+		}
+		else {
+			npState &= ~STATE_OPEN_ERROR;
+		}
 	}
 	debug(true, "Opening");
 	digitalWrite(PIN_DOOR_DIR, DOOR_DIR_OPEN);
@@ -1017,9 +1028,10 @@ openDoor(void)
 	}
 	if (i == 3000 && !digitalRead(PIN_OPEN_LIMIT)) {
 		npState |= STATE_OPEN_ERROR;
-		debug(true, "Limit switch did not trigger while opening. Motion is disabled until reboot.");
+		motionError = time(NULL);
+		debug(true, "Limit switch did not trigger while opening. Motion is disabled for 20 minutes.");
 		if (conf.flags & CFG_NTFY_PROBLEM)
-			ntfy(WiFi.getHostname(), "warning", 5, "Limit switch did not trigger while opening.\\nMotion is disabled until reboot.");
+			ntfy(WiFi.getHostname(), "warning", 5, "Limit switch did not trigger while opening.\\nMotion is disabled for 20 minutes.");
 	}
 	npState |= STATE_OPEN;
 	openAfter = time(NULL);
