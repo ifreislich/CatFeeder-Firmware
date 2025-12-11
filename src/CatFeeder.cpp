@@ -364,7 +364,7 @@ setup()
 {
 	NimBLEService	*pService;
 	NimBLESecurity	*pSecurity;
-	char			 hostname[28];
+	char			 hostname[43];
 	uint16_t		 mid, pid;
 	timeval			 tv;
 
@@ -460,7 +460,7 @@ setup()
 	
 	WiFi.disconnect(true);
 	delay(100);
-	snprintf(hostname, 28, "Feeder-%s", conf.hostname);
+	snprintf(hostname, 42, "Feeder-%s", conf.hostname);
 	if (WiFi.setHostname(hostname))
 		debug(true, "Set hostname to '%s'", hostname);
 	else
@@ -529,8 +529,8 @@ setup()
 		delay(100);
 	})
 	.onProgress([](unsigned int progress, unsigned int total) {
-		if (!(progress % 73728))
-			debug(false, "Received: %7d of %7d", progress, total);
+		//if (!(progress % 73728))
+		//	debug(false, "Received: %7d of %7d", progress, total);
 	})
 	.onError([](ota_error_t error) {
 		const char	*reason;
@@ -755,6 +755,12 @@ loop()
 				Serial.println();
 				menudata[menupos-1] = '\0';
 				strncpy(conf.ssid, menudata, 64);
+				if (npState & STATE_BLE_CONNECTED) {
+					pTxCharacteristic->setValue((uint8_t *)conf.ssid, strlen(conf.ssid));
+					pTxCharacteristic->notify();
+					pTxCharacteristic->setValue((uint8_t *)"\r\n", 2);
+					pTxCharacteristic->notify();
+				}
 				Serial.printf("SSID set to '%s'.  Write to NVRAM to save.\r\n", conf.ssid);
 				if (*conf.ssid && *conf.wpakey)
 					WiFi.begin(conf.ssid, conf.wpakey);
@@ -763,6 +769,12 @@ loop()
 				Serial.println();
 				menudata[menupos-1] = '\0';
 				strncpy(conf.wpakey, menudata, 64);
+				if (npState & STATE_BLE_CONNECTED) {
+					pTxCharacteristic->setValue((uint8_t *)conf.wpakey, strlen(conf.wpakey));
+					pTxCharacteristic->notify();
+					pTxCharacteristic->setValue((uint8_t *)"\r\n", 2);
+					pTxCharacteristic->notify();
+				}
 				Serial.printf("WPA2 PSK set to '%s'.  Write to NVRAM to save.\r\n", conf.wpakey);
 				if (*conf.ssid && *conf.wpakey)
 					WiFi.begin(conf.ssid, conf.wpakey);
@@ -1662,6 +1674,9 @@ ntfy(const char *title, const char *tags, const uint8_t priority, const char *fo
 	esp_err_t	 err;
 	va_list		 pvar;
 	char		*buffer, *message;
+	char		 timestr[20];
+	time_t		 t;
+	struct tm	*tm;
 	int			 content_length, wlen;
 
 	if (~conf.flags & CFG_NTFY_ENABLE)
@@ -1680,6 +1695,10 @@ ntfy(const char *title, const char *tags, const uint8_t priority, const char *fo
 	vsnprintf(message, 2048, format, pvar);
 	va_end(pvar);
 
+	t = time(NULL);
+	tm = localtime(&t);
+	strftime(timestr, 20, "%F %T", tm);
+
 	esp_http_client_config_t config = {
 	  .url = conf.ntfy.url,
 	  .username = conf.flags & CFG_NTFY_AUTH ? conf.ntfy.username : "",
@@ -1696,9 +1715,9 @@ ntfy(const char *title, const char *tags, const uint8_t priority, const char *fo
 	  "\"title\":\"%s\","
 	  "\"tags\":[\"%s\"],"
 	  "\"priority\":%d,"
-	  "\"message\":\"%s\""
+	  "\"message\":\"%s\\n%s\""
 	"}";
-	content_length = snprintf(buffer, 3072, post_data, conf.ntfy.topic, title, tags, priority, message);
+	content_length = snprintf(buffer, 3072, post_data, conf.ntfy.topic, title, tags, priority, timestr, message);
 	err = esp_http_client_open(client, content_length);
 	if (err != ESP_OK) {
 		debug(true, "NTFY connection failed: %s", esp_err_to_name(err));
@@ -1737,7 +1756,7 @@ ntfy(const char *title, const char *tags, const uint8_t priority, const char *fo
 
 void
 wshandleRoot(void) {
-	WiFiClient client = webserver.client();
+	WiFiClient	 client = webserver.client();
 	char		 timestr[20];
 	int			 sec = time(NULL) - bootTime;
 	int			 min = sec / 60;
@@ -2100,15 +2119,10 @@ wsFirmwareUpdate(void)
 void
 wsFirmwareUpdateResult(void)
 {
-	char	*body;
+	WiFiClient	client = webserver.client();
 
-	if ((body = (char *)malloc(600)) == NULL) {
-		debug(true, "WEB / failed to allocate 600 bytes");
-		return;
-	}
-
-	snprintf(body, 600,
-		R"(<!doctype html>
+	client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\n\r\n");
+	client.printf(R"(<!doctype html>
 		<html lang='en'>
 		<head>
 		<title>Feeder [%s]</title>
@@ -2125,13 +2139,9 @@ wsFirmwareUpdateResult(void)
 		Update.hasError() ? 3 : 15,
 		conf.hostname,
 		Update.hasError() ? "Update failed" : "Update Success! Rebooting...");
-
-	webserver.sendHeader("cache-control", "no-store", false);
-	webserver.client().setNoDelay(true);
-	webserver.send_P(200, PSTR("text/html"), body);
+	client.stop();
 
 	if (Update.hasError()) {
-		free(body);
 		if (conf.flags & CFG_NTFY_NOTICE)
 			ntfy(WiFi.getHostname(), "warning", 3, "Update error: %s", Update.errorString());
 	}
@@ -2497,20 +2507,17 @@ wshandleSave(void)
 void
 wshandleSaveSSL()
 {
-	String		 value;
-	char		*body;
+	String		value;
+	WiFiClient	client = webserver.client();
 
-	if ((body = (char *)malloc(400)) == NULL) {
-		debug(true, "WEB / failed to allocate 400 bytes");
-		return;
-	}
 	if (webserver.hasArg("cacrt")) {
 		value = webserver.arg("cacrt");
 		strncpy(conf.cacrt, value.c_str(), MAX_CERT);
+		conf.cacrt[MAX_CERT] = '\0';
 	}
 
-	snprintf(body, 400,
-	  "<!doctype html>"
+	client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\n\r\n");
+	client.printf("<!doctype html>"
 	  "<html lang='en'>\n"
 	  "<head>\n"
 	  "<title>Feeder [%s]</title>\n"
@@ -2523,27 +2530,21 @@ wshandleSaveSSL()
 	  "<meta http-equiv='Refresh' content='3; url=/'>"
 	  "</body>\n"
 	  "</html>", conf.hostname, conf.hostname, webserver.args());
-
-	webserver.sendHeader("cache-control", "no-store", false);
-	webserver.send(200, "text/html", body);
-	free(body);
+	client.stop();
 	saveSettings();
 }
 
 void
 wshandleDoFeed()
 {
-	char	*body;
+	WiFiClient	client = webserver.client();
 	float	 weight;
 	float	 dispensed;
 
-	if ((body = (char *)malloc(400)) == NULL)
-		return;
-
 	weight = getDispenseWeight(weigh(true));
 
-	snprintf(body, 400,
-	  "<!doctype html>"
+	client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\n\r\n");
+	client.printf("<!doctype html>"
 	  "<html lang='en'>\n"
 	  "<head>\n"
 	  "<title>Feeder [%s]</title>\n"
@@ -2556,10 +2557,7 @@ wshandleDoFeed()
 	  "<meta http-equiv='Refresh' content='3; url=/'>"
 	  "</body>\n"
 	  "</html>", conf.hostname, conf.hostname, weight);
-	  
-	webserver.sendHeader("cache-control", "no-store", false);
-	webserver.send(200, "text/html", body);
-	free(body);
+	client.stop();
 	
 	if (weight > 1e-9) {
 		dispensed = dispense(weight);
@@ -2574,15 +2572,12 @@ wshandleDoFeed()
 void
 wshandleCalibrate(void)
 {
-	char	*body;
-
-	if ((body = (char *)malloc(540)) == NULL)
-		return;
+	WiFiClient	client = webserver.client();
 
 	scale.set_scale();
 	scale.tare(100);
-	snprintf(body, 540,
-	  "<!doctype html>"
+	client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\n\r\n");
+	client.printf("<!doctype html>"
 	  "<html lang='en'>\n"
 	  "<head>\n"
 	  "<title>Feeder [%s]</title>\n"
@@ -2598,19 +2593,14 @@ wshandleCalibrate(void)
 	  "</form>"
 	  "</body>\n"
 	  "</html>", conf.hostname, conf.hostname);
-	  
-	webserver.send(200, "text/html", body);
-	free(body);
+	client.stop();
 }
 
 void
 wshandleDoCalibrate(void)
 {
-	char	*body;
-	String	 value;
-
-	if ((body = (char *)malloc(400)) == NULL)
-		return;
+	WiFiClient	client = webserver.client();
+	String		value;
 
 	value = webserver.arg("weight");
 	if (value.length() && value.toInt() >= 1 && value.toInt() <= 2000) {
@@ -2621,8 +2611,8 @@ wshandleDoCalibrate(void)
 		saveSettings();
 	}
 
-	snprintf(body, 400,
-	  "<!doctype html>"
+	client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\n\r\n");
+	client.printf("<!doctype html>"
 	  "<html lang='en'>\n"
 	  "<head>\n"
 	  "<title>Feeder [%s]</title>\n"
@@ -2636,23 +2626,20 @@ wshandleDoCalibrate(void)
 	  "</body>\n"
 	  "</html>", conf.hostname, conf.hostname, conf.scale);
 
-	webserver.sendHeader("cache-control", "no-store", false);
-	webserver.send(200, "text/html", body);
-	free(body);
+	client.stop();
 }
 
 void
 wshandleTare(void)
 {
-	char	*body;
+	WiFiClient	client = webserver.client();
 
-	if ((body = (char *)malloc(400)) == NULL)
-		return;
 	scale.tare(100);
 	conf.offset = scale.get_offset();
 	saveSettings();
 	
-	snprintf(body, 400,
+	client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\n\r\n");
+	client.printf("<!doctype html>"
 	  "<!doctype html>"
 	  "<html lang='en'>\n"
 	  "<head>\n"
@@ -2667,25 +2654,17 @@ wshandleTare(void)
 	  "</body>\n"
 	  "</html>", conf.hostname, conf.hostname, conf.offset);
 	  
-	webserver.sendHeader("cache-control", "no-store", false);
-	webserver.send(200, "text/html", body);
-	free(body);
+	client.stop();
 }
 
 void
 wshandleSchedule(void)
 {
-	char	*body, *temp;
-
-	if ((body = (char *)malloc(5520)) == NULL)
-		return;
-	if ((temp = (char *)malloc(690)) == NULL) {
-		free(body);
-		return;
-	}
+	char		*body, *temp;
+	WiFiClient	client = webserver.client();
 	
-	snprintf(body, 2000,
-	  "<!doctype html>"
+	client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\n\r\n");
+	client.printf("<!doctype html>"
 	  "<html lang='en'>\n"
 	  "<head>\n"
 	  "<title>Feeder [%s]</title>\n"
@@ -2697,10 +2676,8 @@ wshandleSchedule(void)
 	  "<form method='post' action='/schedulesave' name='Schedule'>\n",
 	  conf.hostname, conf.hostname);
 
-	//for (int i = 0; i < CFG_NSCHEDULES; i++) {
-	for (int i = 0; i < 10; i++) {
-		snprintf(temp, 688,
-		  "<table border=0 width='520' cellspacing=4 cellpadding=0>\n"
+	for (int i = 0; i < CFG_NSCHEDULES; i++) {
+		client.printf("<table border=0 width='520' cellspacing=4 cellpadding=0>\n"
 		  "<tr><td width='20%%'><b>Schedule %d:</b></td></tr>\n"
 		  "<tr><td width='20%%'>time:</td><td><input name='t%d' type='time' value='%02d:%02d'></td>"
 		  "<td>Enable:<input name='e%d' type='checkbox' value='true' %s>"
@@ -2711,19 +2688,13 @@ wshandleSchedule(void)
 		  i, conf.schedule[i].flags & CFG_SCHED_ENABLE ? "checked" : "",
 		  i, conf.schedule[i].flags & CFG_SCHED_SKIP ? "checked" : ""
 		);
-		strcat(body, temp);
 	}
-	strcat(body,
-	  "<input name='Save' type='submit' value='Save'>\n"
+	client.print("<input name='Save' type='submit' value='Save'>\n"
 	  "</form>"
 	  "<br>"
 	  "</body>\n"
 	  "</html>");
-
-	webserver.sendHeader("cache-control", "no-store", false);
-	webserver.send(200, "text/html", body);
-	free(body);
-	free(temp);
+	client.stop();
 }
 
 void
@@ -2732,8 +2703,8 @@ wshandleScheduleSave(void)
 	char	*temp;
 	String	 value;
 
-if ((temp = (char *)malloc(400)) == NULL)
-	return;
+	if ((temp = (char *)malloc(400)) == NULL)
+		return;
 
 	for (int i=0; i < CFG_NSCHEDULES; i++) {
 		snprintf(temp, 399, "t%d", i);
