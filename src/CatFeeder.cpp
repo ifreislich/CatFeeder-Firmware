@@ -135,7 +135,6 @@ struct nvhistory {
 #define CFG_CAT_DISPENSE	0x02
 
 #define CFG_SCHED_ENABLE	0x01
-#define CFG_SCHED_SKIP		0x02
 
 #define SCALE_FACTOR		247.408408f
 #define SCALE_OFFSET		62236
@@ -817,7 +816,7 @@ loop()
 			reason1 = time(NULL) < nvdata.lastDispense + conf.cooloff ? "Dispense cooloff" : "";
 			reason2 = feedWeight < 1e-9 ? "Target dispense is zero" : "";
 
-			if (!((conf.schedule[alarmIdx].flags & CFG_SCHED_SKIP) && (~nvdata.state & NVSTATE_CHECK_HOPPER) && (*reason1 || *reason2))) {
+			if (!((~nvdata.state & NVSTATE_CHECK_HOPPER) && (*reason1 || *reason2))) {
 				dispensed = dispense(feedWeight);
 				nvdata.dispensedTotal += dispensed;
 				debug(true, "Auto-dispense: %4.1fg of %4.1fg Dispensed total: %4.1fg of %dg Next dispense: %02d:%02d",
@@ -2321,6 +2320,7 @@ wshandleSave(void)
 		value = webserver.arg("ssid");
 		if (strncmp(value.c_str(), conf.ssid, 63)) {
 			strncpy(conf.ssid, value.c_str(), 63);
+			conf.ssid[63] = '\0';
 			wifiChanged = 1;
 		}
 	}
@@ -2329,6 +2329,7 @@ wshandleSave(void)
 		value = webserver.arg("key");
 		if (strncmp(value.c_str(), conf.wpakey, 63)) {
 			strncpy(conf.wpakey, value.c_str(), 63);
+			conf.wpakey[63] = '\0';
 			wifiChanged = 1;
 		}
 	}
@@ -2340,16 +2341,19 @@ wshandleSave(void)
 	if (webserver.hasArg("name")) {
 		value = webserver.arg("name");
 		strncpy(conf.hostname, value.c_str(), 32);
+		conf.wpakey[32] = '\0';
 	}
 
 	if (webserver.hasArg("ntp")) {
 		value = webserver.arg("ntp");
-		strncpy(conf.ntpserver, value.c_str(), 32);
+		strncpy(conf.ntpserver, value.c_str(), 64);
+		conf.ntpserver[63] = '\0';
 	}
 
 	if (webserver.hasArg("tz")) {
 		value = webserver.arg("tz");
 		strncpy(conf.timezone, value.c_str(), 32);
+		conf.ntpserver[31] = '\0';
 	}
 
 	value = webserver.arg("quota");
@@ -2412,21 +2416,25 @@ wshandleSave(void)
 	if (webserver.hasArg("url")) {
 		value = webserver.arg("url");
 		strncpy(conf.ntfy.url, value.c_str(), 64);
+		conf.ntfy.url[63] = '\0';
 	}
 
 	if (webserver.hasArg("topic")) {
 		value = webserver.arg("topic");
 		strncpy(conf.ntfy.topic, value.c_str(), 64);
+		conf.ntfy.topic[63] = '\0';
 	}
 
 	if (webserver.hasArg("user")) {
 		value = webserver.arg("user");
 		strncpy(conf.ntfy.username, value.c_str(), 16);
+		conf.ntfy.username[15] = '\0';
 	}
 
 	if (webserver.hasArg("passwd")) {
 		value = webserver.arg("passwd");
 		strncpy(conf.ntfy.password, value.c_str(), 16);
+		conf.ntfy.password[15] = '\0';
 	}
 
 	if (webserver.hasArg("snmp"))
@@ -2437,12 +2445,14 @@ wshandleSave(void)
 	if (webserver.hasArg("snmpro")) {
 		value = webserver.arg("snmpro");
 		strncpy(conf.snmpro, value.c_str(), 64);
+		conf.snmpro[63] = '\0';
 		snmp.setReadOnlyCommunity(conf.snmpro);
 	}
 
 	if (webserver.hasArg("snmprw")) {
 		value = webserver.arg("snmprw");
 		strncpy(conf.snmprw, value.c_str(), 64);
+		conf.snmprw[63] = '\0';
 		snmp.setReadWriteCommunity(conf.snmprw);
 	}
 
@@ -2451,6 +2461,7 @@ wshandleSave(void)
 		if (webserver.hasArg(temp)) {
 			value = webserver.urlDecode(webserver.arg(temp));
 			strncpy(conf.cat[i].name, value.c_str(), 20);
+			conf.cat[i].name[19] = '\0';
 		}
 
 		snprintf(temp, 399, "facility%d", i);
@@ -2680,13 +2691,11 @@ wshandleSchedule(void)
 		client.printf("<table border=0 width='520' cellspacing=4 cellpadding=0>\n"
 		  "<tr><td width='20%%'><b>Schedule %d:</b></td></tr>\n"
 		  "<tr><td width='20%%'>time:</td><td><input name='t%d' type='time' value='%02d:%02d'></td>"
-		  "<td>Enable:<input name='e%d' type='checkbox' value='true' %s>"
-		  "Allow skip:<input name='s%d' type='checkbox' value='true' %s></td></tr>\n"
+		  "<td>Enable:<input name='e%d' type='checkbox' value='true' %s></td>"
 		  "</table><p>",
 		  i + 1,
 		  i, conf.schedule[i].hour, conf.schedule[i].minute,
-		  i, conf.schedule[i].flags & CFG_SCHED_ENABLE ? "checked" : "",
-		  i, conf.schedule[i].flags & CFG_SCHED_SKIP ? "checked" : ""
+		  i, conf.schedule[i].flags & CFG_SCHED_ENABLE ? "checked" : ""
 		);
 	}
 	client.print("<input name='Save' type='submit' value='Save'>\n"
@@ -2724,12 +2733,6 @@ wshandleScheduleSave(void)
 			conf.schedule[i].flags |= CFG_SCHED_ENABLE;
 		else
 			conf.schedule[i].flags &= ~CFG_SCHED_ENABLE;
-
-		snprintf(temp, 399, "s%d", i);
-		if (webserver.hasArg(temp))
-			conf.schedule[i].flags |= CFG_SCHED_SKIP;
-		else
-			conf.schedule[i].flags &= ~CFG_SCHED_SKIP;
 	}
 
 	snprintf(temp, 400,
