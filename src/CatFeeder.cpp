@@ -800,6 +800,21 @@ loop()
 
 	if (npState & STATE_RTC_INTR && time(NULL) - lastAuth > VISIT_TIMEOUT) {
 		npState &= ~STATE_RTC_INTR;
+		if (rtc.alarmFired(2)) {
+			debug(true, "RTC Alarm 2");
+			rtc.clearAlarm(2);
+			history.day[0].end = weigh(true);
+			history.day[0].dispensed = nvdata.dispensedTotal;
+			for (int i = HISTORY_NDAYS - 1; i > 0; i--) {
+				history.day[i].dispensed = history.day[i-1].dispensed;
+				history.day[i].start = history.day[i-1].start;
+				history.day[i].end = history.day[i-1].end;
+			}
+			history.day[0].start = weigh(true);
+			saveNvHistory();
+			nvdata.dispensedTotal = 0;
+			debug(true, "Reset dispensed total");
+		}
 		if (~npState & STATE_NO_SCHEDULE && rtc.alarmFired(1)) {
 			float	feedWeight;
 			float	curWeight;
@@ -836,21 +851,6 @@ loop()
 					  conf.schedule[alarmNextIdx].hour, conf.schedule[alarmNextIdx].minute);
 			}
 			setAlarm(alarmNextIdx); 
-		}
-		if (rtc.alarmFired(2)) {
-			debug(true, "RTC Alarm 2");
-			rtc.clearAlarm(2);
-			history.day[0].end = weigh(true);
-			history.day[0].dispensed = nvdata.dispensedTotal;
-			for (int i = HISTORY_NDAYS - 1; i > 0; i--) {
-				history.day[i].dispensed = history.day[i-1].dispensed;
-				history.day[i].start = history.day[i-1].start;
-				history.day[i].end = history.day[i-1].end;
-			}
-			history.day[0].start = weigh(true);
-			saveNvHistory();
-			nvdata.dispensedTotal = 0;
-			debug(true, "Reset dispensed total");
 		}
 		saveNvData();
 	}
@@ -1066,10 +1066,10 @@ dispense(float grams)
 	enableAuger();
 	// This is a bit of a magic number. 5 revolutions with a reversal
 	// of 0.25 revolution every revolution dispenses about 10 grams
-	// if the kibbles don't get stuck. So, try rotating 4 as much as
-	// needed which works out to 2 revolution per gram.
+	// if the kibbles don't get stuck. So, try rotating 8 as much as
+	// needed which works out to max 4 revolutions per gram.
 	curWeight = startWeight;
-	for(uint8_t i = 0, stop = 0; !stop && i < conf.maxFood * 2; i++) {
+	for(uint8_t i = 0, stop = 0; !stop && i < conf.maxFood * 4; i++) {
 		digitalWrite(PIN_AUGER_DIR, AUGER_DIR_CW);
 		for (int i = 0; !stop && i < 3200; i++) {
 			digitalWrite(PIN_AUGER_STEP, HIGH);
