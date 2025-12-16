@@ -1985,6 +1985,7 @@ wshandleMaintenance(void)
 	%s
 	<p><a href='/tare'>Zero the scale</a></p>
 	<p><a href='/configuration.json'>Download configuration file</a></p>
+	<p><a href='/nvhistory.txt'>Download history</a></p>
 	<p><form method='POST' action='/upload' enctype='multipart/form-data'>
 		Configuration:<br><input type='file' accept='.json' name='configuration'>
 		<input type='submit' value='Restore'>
@@ -2189,36 +2190,40 @@ wshandleGraphData(void)
 void
 wshandleNVHistory(void)
 {
-	char	*body, *p;
-	char	 timestr[13];
-	int		 i, len;
-	time_t	 td, t = time(NULL);
+	WiFiClient	client = webserver.client();
+	char		*p;
+	char		 timestr[13], body[1460];
+	int			 i, len;
+	time_t		 td, t = time(NULL);
 	struct tm	*tm;
 
-	if ((body = (char *)malloc(11712)) == NULL) {
-		debug(true, "WEB / failed to allocate 11712 bytes");
-		return;
-	}
-
 	p = body;
-	len = sprintf(p, "Date, Start, Dispensed, End\n");
+	len = snprintf(p, 1460, "HTTP/1.1 200 OK\n"
+		"Content-Disposition: attachment\n"
+    	"Content-Type: text/plain\n"
+    	"Cache-Control: no-store\n"
+    	"\n"
+		"Date, Start, Dispensed, End\n");
 	p += len;
-	for (i = HISTORY_NDAYS - 1 ; i >= 0; i--) {
+	for (i = 0; i < HISTORY_NDAYS; i++) {
 		if (i && history.day[i].start == 0 && history.day[i].dispensed == 0 && history.day[i].end == 0)
 			continue;
+		if (p - body > 1400) {
+			client.write(body, p - body);
+			p = body;
+		}
 		td = t - i * 86400;
 		tm = localtime(&td);
 		strftime(timestr, 13, "%F", tm);
 
-		len = sprintf(p, "%s, %5.1f, %5.1f, %5.1f\n", timestr,
+		len = snprintf(p, 1460 - (p - body), "%s, %5.1f, %5.1f, %5.1f\n", timestr,
 		  history.day[i].start, i == 0 ? nvdata.dispensedTotal : history.day[i].dispensed,
 		  i == 0 ? weigh(true) : history.day[i].end);
 		p += len;
 	}
-
-	webserver.sendHeader("cache-control", "no-store", false);
-	webserver.send(200, "text/plain", body);
-	free(body);
+	if (p - body)
+		client.write(body, p - body);
+	client.stop();
 }
 
 void
