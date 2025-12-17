@@ -811,7 +811,6 @@ loop()
 			rtc.clearAlarm(2);
 			history.day[0].end = weigh(true);
 			history.day[0].dispensed = nvdata.dispensedTotal;
-			history.day[0].time = time(NULL);
 			for (int i = HISTORY_NDAYS - 1; i > 0; i--) {
 				history.day[i].time = history.day[i-1].time;
 				history.day[i].dispensed = history.day[i-1].dispensed;
@@ -819,6 +818,7 @@ loop()
 				history.day[i].end = history.day[i-1].end;
 			}
 			history.day[0].start = weigh(true);
+			history.day[0].time = time(NULL);
 			saveNvHistory();
 			nvdata.dispensedTotal = 0;
 			debug(true, "Reset dispensed total");
