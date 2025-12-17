@@ -108,6 +108,7 @@ struct nvdata {
 struct nvhistory {
 	uint32_t	magic;
 	struct {
+		time_t	time;
 		float	dispensed;
 		float	start;
 		float	end;
@@ -196,6 +197,7 @@ struct nvhistory {
 #define STATE_BLE_CONNECTED	0x00008000
 #define STATE_BLE_DATA		0x00010000
 #define STATE_OPEN_ERROR	0x00020000
+#define STATE_HISTORY_ERROR	0x00040000
 
 #define OFFSET_CONFIG		0
 #define OFFSET_NVDATA		OFFSET_CONFIG + sizeof(struct cfg)
@@ -228,6 +230,7 @@ String					 BleData;
 #define UUID_UART		"6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define UUID_RX			"6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 #define UUID_TX			"6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
 class MyServerCallbacks: public BLEServerCallbacks {
 	void onConnect(BLEServer* pServer) {
 		npState |= STATE_BLE_CONNECTED;
@@ -273,6 +276,8 @@ void wshandleUpload(void);
 void wshandleUploadResult(void);
 void wsFirmwareUpdate(void);
 void wsFirmwareUpdateResult(void);
+void wshandleHistoryUpload(void);
+void wshandleHistoryUploadResult(void);
 
 int checkCard(uint8_t, uint16_t);
 const char *catName(uint8_t, uint16_t);
@@ -575,6 +580,7 @@ setup()
 	webserver.on("/configuration.json", wshandleDownloadConfig);
 	webserver.on("/upload", HTTP_POST, wshandleUploadResult, wshandleUpload);
 	webserver.on("/fwupdate", HTTP_POST, wsFirmwareUpdateResult, wsFirmwareUpdate);
+	webserver.on("/historyupload", HTTP_POST, wshandleHistoryUploadResult, wshandleHistoryUpload);
 	webserver.onNotFound(wshandle404);
 	webserver.begin();
 	ArduinoOTA.begin();
@@ -805,7 +811,9 @@ loop()
 			rtc.clearAlarm(2);
 			history.day[0].end = weigh(true);
 			history.day[0].dispensed = nvdata.dispensedTotal;
+			history.day[0].time = time(NULL);
 			for (int i = HISTORY_NDAYS - 1; i > 0; i--) {
+				history.day[i].time = history.day[i-1].time;
 				history.day[i].dispensed = history.day[i-1].dispensed;
 				history.day[i].start = history.day[i-1].start;
 				history.day[i].end = history.day[i-1].end;
@@ -1987,12 +1995,16 @@ wshandleMaintenance(void)
 	<p><a href='/configuration.json'>Download configuration file</a></p>
 	<p><a href='/nvhistory.txt'>Download history</a></p>
 	<p><form method='POST' action='/upload' enctype='multipart/form-data'>
-		Configuration:<br><input type='file' accept='.json' name='configuration'>
+		Upload Configuration:<br><input type='file' accept='.json' name='configuration'>
 		<input type='submit' value='Restore'>
 	</form></p>
 	<p><form method='POST' action='/fwupdate' enctype='multipart/form-data'>
-		Firmware:<br><input type='file' accept='.bin' name='firmware'>
+		Upload Firmware:<br><input type='file' accept='.bin' name='firmware'>
 		<input type='submit' value='Install'>
+	</form></p>
+	<p><form method='POST' action='/historyupload' enctype='multipart/form-data'>
+		Upload History:<br><input type='file' accept='.txt' name='history'>
+		<input type='submit' value='Restore'>
 	</form></p>
 	<p><form method='post' action='/reboot' name='Reboot'>
 		<input name='Reboot' type='submit' value='Reboot'>
@@ -2153,12 +2165,102 @@ wsFirmwareUpdateResult(void)
 }
 
 void
+wshandleHistoryUploadResult(void)
+{
+	WiFiClient client = webserver.client();
+
+	client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\ncache-control: no-store\r\n\r\n");
+	client.printf("<!doctype html>"
+	"<html lang='en'>\n"
+	"<head>\n"
+	"<title>Feeder [%s]</title>\n"
+	"<link rel='icon' type='image/x-icon' href='/favicon.ico'>"
+	"<style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>\n"
+	"</head>\n"
+	"<body>\n"
+	"<h1>Feeder %s</h1>"
+	"%s"
+	"<meta http-equiv='Refresh' content='2; url=/'>"
+	"</body>\n"
+	"</html>", conf.hostname, conf.hostname,
+	npState & STATE_HISTORY_ERROR ? "Error reading history data" : "History reloaded."
+	);
+
+	client.stop();
+	npState &= ~STATE_HISTORY_ERROR;
+}
+
+void
+wshandleHistoryUpload(void)
+{
+	static char	*data = NULL;
+	HTTPUpload& upload = webserver.upload();
+
+	switch (upload.status) {
+	  case UPLOAD_FILE_START:
+		debug(true, "Upload started. Filename: %s", upload.filename.c_str());
+		npState &= ~STATE_HISTORY_ERROR;
+		break;
+	  case UPLOAD_FILE_WRITE:
+		if ((data = (char *)realloc(data, upload.currentSize + upload.totalSize + 1)) != NULL) {
+			memcpy(data + upload.totalSize, upload.buf, upload.currentSize);
+		}
+		break;
+	  case UPLOAD_FILE_END:
+		debug(true, "Upload end");
+		if (data) {
+			char		*p, *q;
+			int			 i = 0;
+			struct tm	 tm;
+			float		 start, dispensed, end;
+
+			tm.tm_isdst = 0;
+			data[upload.totalSize] = '\0'; // strchr() is safe because the string is always terminated
+			p = data;
+			while (i < HISTORY_NDAYS) {
+				q = strchr(p, '\n');
+				if (*q == '\n') {
+					if (q > p && *(q - 1) == '\r')
+						*(q - 1) = '\0';
+					*q++ = '\0';
+				}
+				if (sscanf(p, "%d-%d-%d, %f, %f, %f", &tm.tm_year, &tm.tm_mon, &tm.tm_mday, &start, &dispensed, &end) == 6) {
+					tm.tm_year -= 1900;
+					tm.tm_mon -= 1;
+					tm.tm_hour = 0;
+					tm.tm_min = 0;
+					tm.tm_sec = 0;
+					history.day[i].time = mktime(&tm);
+					history.day[i].start = start;
+					history.day[i].dispensed = dispensed;
+					history.day[i].end = end;
+					i++;
+				}
+				if (q - data >= upload.totalSize)
+					break;
+				p = q;
+			}
+			free(data);
+			data = NULL;
+			saveNvHistory();
+		}
+		break;
+	  case UPLOAD_FILE_ABORTED:
+		if (data) {
+			free(data);
+			data = NULL;
+		}
+		npState |= STATE_HISTORY_ERROR;
+		break;
+	}
+}
+
+void
 wshandleGraphData(void)
 {
 	char	*body, *p;
 	char	 timestr[13];
 	int		 i, len;
-	time_t	 td, t = time(NULL);
 	struct tm	*tm;
 
 	if ((body = (char *)malloc(8800)) == NULL) {
@@ -2172,8 +2274,7 @@ wshandleGraphData(void)
 	for (i = HISTORY_NDAYS - 1 ; i >= 0; i--) {
 		if (i && history.day[i].start == 0 && history.day[i].dispensed == 0 && history.day[i].end == 0)
 			continue;
-		td = t - i * 86400;
-		tm = localtime(&td);
+		tm = localtime(&history.day[i].time);
 		strftime(timestr, 13, "%F", tm);
 
 		len = sprintf(p, "%s, %5.1f\n", timestr,
@@ -2194,7 +2295,6 @@ wshandleNVHistory(void)
 	char		*p;
 	char		 timestr[13], body[1460];
 	int			 i, len;
-	time_t		 td, t = time(NULL);
 	struct tm	*tm;
 
 	p = body;
@@ -2212,8 +2312,7 @@ wshandleNVHistory(void)
 			client.write(body, p - body);
 			p = body;
 		}
-		td = t - i * 86400;
-		tm = localtime(&td);
+		tm = localtime(&history.day[i].time);
 		strftime(timestr, 13, "%F", tm);
 
 		len = snprintf(p, 1460 - (p - body), "%s, %5.1f, %5.1f, %5.1f\n", timestr,
