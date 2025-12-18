@@ -596,7 +596,7 @@ void
 loop()
 {
 	static char	 menudata[128];
-	static int	 menupos = 0;
+	static int	 menupos = 0, isdst = -1;
 	int			 BleDataPos = 0;
 	const char	*text;
 	uint8_t		 facilityCode = 0, alarmIdx, alarmNextIdx;	// decoded facility code
@@ -805,6 +805,8 @@ loop()
 	}
 
 	if (npState & STATE_RTC_INTR && time(NULL) - lastAuth > VISIT_TIMEOUT) {
+		time_t		 t = time(NULL);
+		struct tm	*tm = localtime(&t);
 		npState &= ~STATE_RTC_INTR;
 		if (rtc.alarmFired(2)) {
 			debug(true, "RTC Alarm 2");
@@ -861,6 +863,12 @@ loop()
 			setAlarm(alarmNextIdx); 
 		}
 		saveNvData();
+		if (isdst != tm->tm_isdst) {
+			debug(true, "Reset midnight alarm");
+			DateTime alarm2(__DATE__, "00:00:00");
+			rtc.setAlarm2(alarm2 - getTz(), DS3231_A2_Hour);
+			isdst = tm->tm_isdst;
+		}
 	}
 	
 	// Time to open the door?
