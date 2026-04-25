@@ -666,7 +666,7 @@ loop()
 				break;
 			  case 'f':
 				nvdata.dispensedTotal = 0;
-				npState &= STATE_OPEN | STATE_MENU_SELECT;
+				npState &= STATE_OPEN | STATE_MENU_SELECT | STATE_FRAM_PRESENT;
 				nvdata.lastDispense = time(NULL) - conf.cooloff * 60;
 				nvdata.magic = MAGIC;
 				defaultSettings();
@@ -1694,7 +1694,7 @@ ntfy(const char *title, const char *tags, const uint8_t priority, const char *fo
 	struct tm	*tm;
 	int			 content_length, wlen;
 
-	if (~conf.flags & CFG_NTFY_ENABLE)
+	if (~conf.flags & CFG_NTFY_ENABLE || !strlen(conf.ntfy.url))
 		return;
 
 	if ((buffer = (char *)malloc(3072)) == NULL) {
