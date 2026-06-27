@@ -1,0 +1,19 @@
+Hover:
+  ShowAKA: Yes
+CompileFlags:
+  Add:
+    [
+      -ferror-limit=0
+    ]
+  Remove:
+    [
+      -fno-reorder-functions,
+      -mlongcalls,
+      -fstrict-volatile-bitfields,
+      -fno-tree-switch-conversion
+    ]
+Diagnostics:
+  UnusedIncludes: Strict
+  Suppress:
+    [
+    ]
