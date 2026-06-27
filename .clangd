@@ -1,5 +1,6 @@
 Hover:
   ShowAKA: Yes
+  MacroContentsLimit: 2048
 CompileFlags:
   Add:
     [

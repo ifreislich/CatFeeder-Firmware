@@ -1,4 +1,9 @@
 .pio
 .vscode
+backup.sh
+compile_commands.json
+src/attribution
 src/dygraph.css
 src/dygraph.min.js
+src/cat1.png
+src/favicon-flaticon.ico
